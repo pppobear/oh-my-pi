@@ -19,6 +19,7 @@ import platform
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -201,6 +202,84 @@ _SHARED_OMP_GID = 2000
 
 def _slot_permissions_active(slot_uid: int | None) -> bool:
     return slot_uid is not None and platform.system() == "Linux" and os.geteuid() == 0
+
+
+def _slot_pids(slot_uid: int, proc_root: Path = Path("/proc")) -> tuple[int, ...]:
+    """Return non-zombie process ids owned by the slot UID.
+
+    Debian's slim image does not include procps/pkill. Reading `/proc` keeps
+    slot cleanup self-contained and avoids adding a runtime package only for
+    this one operation.
+    """
+    try:
+        entries = tuple(proc_root.iterdir())
+    except OSError as exc:
+        log.warning("failed to scan %s for slot user %s: %s", proc_root, slot_uid, exc)
+        return ()
+
+    pids: list[int] = []
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="utf-8")
+        except OSError:
+            # The process may have exited between `iterdir` and `read_text`.
+            continue
+
+        state = ""
+        uids: tuple[int, ...] = ()
+        for line in status.splitlines():
+            if line.startswith("State:"):
+                parts = line.split(maxsplit=1)
+                state = parts[1] if len(parts) == 2 else ""
+            elif line.startswith("Uid:"):
+                try:
+                    uids = tuple(int(part) for part in line.split()[1:5])
+                except ValueError:
+                    uids = ()
+
+        if state.startswith("Z"):
+            continue
+        if slot_uid in uids:
+            pids.append(int(entry.name))
+    return tuple(pids)
+
+
+def _reap_slot(slot_uid: int | None) -> None:
+    """Kill any processes still running as a slot UID.
+
+    Slot UIDs are reused. A previous task's straggler process must not survive
+    long enough to observe or interfere with the next task assigned to that UID.
+    """
+    if not _slot_permissions_active(slot_uid):
+        return
+    assert slot_uid is not None
+    for pid in _slot_pids(slot_uid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            log.warning("failed to kill slot user %s process %s: %s", slot_uid, pid, exc)
+
+
+def _prepare_slot_tmpdir(workspace: Workspace, slot_uid: int | None) -> Path:
+    """Create the per-workspace temp directory used by the agent subprocess."""
+    tmpdir = workspace.root / ".omp-tmp"
+    try:
+        st = tmpdir.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISDIR(st.st_mode):
+            tmpdir.unlink()
+    tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if _slot_permissions_active(slot_uid):
+        assert slot_uid is not None
+        os.chown(tmpdir, slot_uid, slot_uid)
+    tmpdir.chmod(0o700)
+    return tmpdir
 
 
 def _grant_group_bits(path: Path, *, gid: int, bits: int) -> None:

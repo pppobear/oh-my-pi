@@ -15,6 +15,10 @@ class SlotPool:
             self._available.put_nowait(slot_uid)
         self._checked_out: set[int] = set()
 
+    @property
+    def slot_uids(self) -> tuple[int, ...]:
+        return self._slot_uids
+
     async def acquire(self) -> int | None:
         if not self._slot_uids:
             return None

@@ -14,7 +14,7 @@ from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
 from robomp.db import Database, EventRow
 from robomp.github_backend import GitHubBackend
-from robomp.sandbox import GitTransport, SandboxManager
+from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
 
 log = logging.getLogger(__name__)
@@ -84,7 +84,13 @@ class WorkerPool:
         async with self._inflight_lock:
             return sorted(self._inflight)
 
+    async def _reap_all_slots(self) -> None:
+        if self._slot_pool is None:
+            return
+        await asyncio.gather(*(asyncio.to_thread(_reap_slot, uid) for uid in self._slot_pool.slot_uids))
+
     async def start(self) -> None:
+        await self._reap_all_slots()
         recovered = self.db.reset_stuck_running()
         if recovered:
             log.info("recovered stuck events", extra={"count": recovered})
@@ -270,7 +276,10 @@ class WorkerPool:
             self._shutdown_cancelled.discard(row.delivery_id)
             self._cancel_hooks.pop(row.delivery_id, None)
             if slot_acquired and self._slot_pool is not None:
-                self._slot_pool.release(slot_uid)
+                try:
+                    _reap_slot(slot_uid)
+                finally:
+                    self._slot_pool.release(slot_uid)
             await self._release(row)
             clear_current_event(token)
 

@@ -11,11 +11,16 @@ import uvicorn
 
 from robomp.config import Settings, get_settings
 from robomp.db import INACTIVE_EVENT_STATES, get_database
-from robomp.github_backend import GitHubBackend
 from robomp.logging_config import configure_logging
-from robomp.manual_triage import InvalidIssueRef, ManualTriageError, enqueue_manual_triage, parse_issue_ref
-from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
-from robomp.queue import WorkerPool
+from robomp.manual_triage import (
+    InvalidIssueRef,
+    ManualTriageError,
+    ManualTriageTimeout,
+    await_terminal_state,
+    enqueue_manual_triage,
+    parse_issue_ref,
+)
+from robomp.proxy_client import GitHubProxyClient
 from robomp.sandbox import SandboxManager
 from robomp.server import create_app
 
@@ -42,11 +47,13 @@ def _require_proxy_mode(cfg: Settings) -> tuple[str, bytes]:
     return cfg.gh_proxy_url, cfg.gh_proxy_hmac_key.get_secret_value().encode("utf-8")
 
 
-def _build_orchestrator(cfg: Settings) -> tuple[GitHubBackend, ProxyGitTransport]:
+def _build_github(cfg: Settings) -> GitHubProxyClient:
     base_url, key = _require_proxy_mode(cfg)
-    github = GitHubProxyClient(base_url=base_url, hmac_key=key)
-    transport = ProxyGitTransport(base_url=base_url, hmac_key=key)
-    return github, transport
+    return GitHubProxyClient(base_url=base_url, hmac_key=key)
+
+
+def _default_wait_timeout(cfg: Settings) -> float:
+    return cfg.task_timeout_seconds + cfg.task_timeout_hard_grace_seconds + 30.0
 
 
 @click.group()
@@ -66,7 +73,13 @@ def serve() -> None:
 
 @main.command()
 @click.argument("issue_ref")
-def triage(issue_ref: str) -> None:
+@click.option(
+    "--wait-timeout",
+    type=click.FloatRange(min=0.1),
+    default=None,
+    help="Seconds to wait for a terminal state before returning non-zero (default: task timeout + hard grace + 30).",
+)
+def triage(issue_ref: str, wait_timeout: float | None) -> None:
     """Fetch a live issue and queue it as if a webhook arrived.
 
     ISSUE_REF is `owner/repo#NN`.
@@ -84,7 +97,7 @@ def triage(issue_ref: str) -> None:
         sys.exit(2)
 
     async def _go() -> None:
-        github, git_transport = _build_orchestrator(cfg)
+        github = _build_github(cfg)
         db = get_database(cfg.sqlite_path)
         try:
             delivery = await enqueue_manual_triage(
@@ -96,28 +109,45 @@ def triage(issue_ref: str) -> None:
         except ManualTriageError as exc:
             click.echo(f"refusing: {exc}", err=True)
             sys.exit(2)
-        sandbox = SandboxManager(cfg.workspace_root, transport=git_transport)
-        pool = WorkerPool(settings=cfg, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
-        await pool.start()
-        pool.wake()
-        # Drain until the event finishes.
-        while True:
-            await asyncio.sleep(2.0)
-            row = db.get_event(delivery)
-            if row is None:
-                break
-            if row.state in ("done", "failed", "skipped"):
-                click.echo(json.dumps({"delivery": delivery, "state": row.state, "error": row.last_error}, indent=2))
-                break
-        await pool.stop()
+        # The dispatcher loop lives in the long-running `serve` process; we
+        # only watch the row land in a terminal state. Wake latency is
+        # bounded by `WorkerPool._dispatch_loop`'s 10s `_wakeup.wait()` fallback.
+        click.echo(json.dumps({"delivery": delivery, "state": "queued"}, indent=2))
+        timeout = wait_timeout if wait_timeout is not None else _default_wait_timeout(cfg)
+        try:
+            final = await await_terminal_state(db, delivery, timeout=timeout)
+        except ManualTriageTimeout as exc:
+            click.echo(
+                json.dumps(
+                    {"delivery": delivery, "state": exc.state, "timed_out": True, "error": str(exc)},
+                    indent=2,
+                ),
+                err=True,
+            )
+            sys.exit(1)
+        if final is None:
+            click.echo(json.dumps({"delivery": delivery, "state": "missing"}, indent=2))
+            return
+        click.echo(
+            json.dumps(
+                {"delivery": delivery, "state": final.state, "error": final.last_error},
+                indent=2,
+            )
+        )
 
     asyncio.run(_go())
 
 
 @main.command()
 @click.argument("delivery_id")
-def replay(delivery_id: str) -> None:
-    """Force a stored event back into the queue and run a one-shot drain."""
+@click.option(
+    "--wait-timeout",
+    type=click.FloatRange(min=0.1),
+    default=None,
+    help="Seconds to wait for a terminal state before returning non-zero (default: task timeout + hard grace + 30).",
+)
+def replay(delivery_id: str, wait_timeout: float | None) -> None:
+    """Re-enqueue a stored event so the running `serve` pool can pick it up."""
     cfg = _settings_or_die()
     configure_logging(cfg.log_dir)
     cfg.ensure_paths()
@@ -127,25 +157,36 @@ def replay(delivery_id: str) -> None:
         click.echo(f"unknown delivery: {delivery_id}", err=True)
         sys.exit(2)
     if not db.requeue_event(delivery_id, from_states=INACTIVE_EVENT_STATES):
-        click.echo(f"delivery {delivery_id} is {row.state}; only inactive events can be replayed", err=True)
+        click.echo(
+            f"delivery {delivery_id} is {row.state}; only inactive events can be replayed",
+            err=True,
+        )
         sys.exit(2)
 
-    async def _drain() -> None:
-        github, git_transport = _build_orchestrator(cfg)
-        sandbox = SandboxManager(cfg.workspace_root, transport=git_transport)
-        pool = WorkerPool(settings=cfg, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
-        await pool.start()
-        pool.wake()
-        while True:
-            await asyncio.sleep(2.0)
-            row = db.get_event(delivery_id)
-            if row is None or row.state in ("done", "failed", "skipped"):
-                break
-        await pool.stop()
-        if row is not None:
-            click.echo(json.dumps({"delivery": delivery_id, "state": row.state, "error": row.last_error}, indent=2))
+    async def _wait() -> None:
+        timeout = wait_timeout if wait_timeout is not None else _default_wait_timeout(cfg)
+        try:
+            final = await await_terminal_state(db, delivery_id, timeout=timeout)
+        except ManualTriageTimeout as exc:
+            click.echo(
+                json.dumps(
+                    {"delivery": delivery_id, "state": exc.state, "timed_out": True, "error": str(exc)},
+                    indent=2,
+                ),
+                err=True,
+            )
+            sys.exit(1)
+        if final is None:
+            click.echo(json.dumps({"delivery": delivery_id, "state": "missing"}, indent=2))
+            return
+        click.echo(
+            json.dumps(
+                {"delivery": delivery_id, "state": final.state, "error": final.last_error},
+                indent=2,
+            )
+        )
 
-    asyncio.run(_drain())
+    asyncio.run(_wait())
 
 
 @main.command()

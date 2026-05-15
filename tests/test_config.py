@@ -125,3 +125,10 @@ def test_pick_model_covers_full_pool(monkeypatch: pytest.MonkeyPatch, env: dict[
 def test_max_concurrency_default_is_8(env: dict[str, str]) -> None:
     cfg = Settings()  # type: ignore[call-arg]
     assert cfg.max_concurrency == 8
+
+
+def test_task_timeout_hard_grace_env_parses(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv("ROBOMP_TASK_TIMEOUT_HARD_GRACE_SECONDS", "12.5")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.task_timeout_hard_grace_seconds == 12.5

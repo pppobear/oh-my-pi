@@ -221,3 +221,70 @@ async def test_cancel_unknown_delivery_returns_false(settings: Settings, db: Dat
     # The set still records the request — a later register would fire — but
     # since no worker is armed, the cancel is harmless.
     assert "never-existed" in pool._cancelled  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_start_reaps_configured_slot_uids(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr("robomp.queue._reap_slot", lambda uid: calls.append(uid))
+    pool = WorkerPool(
+        settings=settings,
+        db=db,
+        github=_StubGitHub(),  # type: ignore[arg-type]
+        sandbox=_StubSandbox(),  # type: ignore[arg-type]
+        git_transport=_StubGitTransport(),  # type: ignore[arg-type]
+        slot_pool=SlotPool([2001, 2002]),
+    )
+
+    await pool.start()
+    try:
+        assert sorted(calls) == [2001, 2002]
+    finally:
+        await pool.stop(drain_timeout=0.01, kill_timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_run_event_reaps_slot_before_release(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slot_pool = SlotPool([2001])
+    pool = WorkerPool(
+        settings=settings,
+        db=db,
+        github=_StubGitHub(),  # type: ignore[arg-type]
+        sandbox=_StubSandbox(),  # type: ignore[arg-type]
+        git_transport=_StubGitTransport(),  # type: ignore[arg-type]
+        slot_pool=slot_pool,
+    )
+    db.record_event(
+        delivery_id="d-slot",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key="octo/widget#1",
+        payload={"action": "opened"},
+        state="running",
+    )
+    order: list[tuple[str, int | None]] = []
+    monkeypatch.setattr("robomp.queue._reap_slot", lambda uid: order.append(("reap", uid)))
+    release = slot_pool.release
+
+    def record_release(slot_uid: int | None) -> None:
+        order.append(("release", slot_uid))
+        release(slot_uid)
+
+    monkeypatch.setattr(slot_pool, "release", record_release)
+
+    async def fake_dispatch(self: WorkerPool, r: EventRow, *, slot_uid: int | None = None) -> None:
+        assert r.delivery_id == "d-slot"
+        assert slot_uid == 2001
+
+    monkeypatch.setattr(WorkerPool, "_dispatch", fake_dispatch)
+
+    await pool._run_event(_row("d-slot"))  # noqa: SLF001
+
+    stored = db.get_event("d-slot")
+    assert stored is not None
+    assert stored.state == "done"
+    assert order == [("reap", 2001), ("release", 2001)]

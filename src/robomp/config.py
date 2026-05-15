@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     # Runtime
     max_concurrency: int = Field(8, alias="ROBOMP_MAX_CONCURRENCY")
     task_timeout_seconds: float = Field(2400.0, alias="ROBOMP_TASK_TIMEOUT_SECONDS")
+    task_timeout_hard_grace_seconds: float = Field(60.0, alias="ROBOMP_TASK_TIMEOUT_HARD_GRACE_SECONDS")
     request_timeout_seconds: float = Field(120.0, alias="ROBOMP_REQUEST_TIMEOUT_SECONDS")
     omp_command: str = Field("omp", alias="ROBOMP_OMP_COMMAND")
 

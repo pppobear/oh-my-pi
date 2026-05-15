@@ -111,12 +111,12 @@ exec +CMD:
 # ───────── robomp cli (in-container) ─────────
 
 [group('cli')]
-[doc('robomp triage owner/repo#N — drive full pipeline against a live issue')]
+[doc('robomp triage owner/repo#N — enqueue a live issue and wait for completion')]
 triage ISSUE_REF:
     docker compose exec {{SERVICE}} robomp triage '{{ISSUE_REF}}'
 
 [group('cli')]
-[doc('robomp replay <delivery_id> — re-enqueue a stored webhook event')]
+[doc('robomp replay <delivery_id> — re-enqueue a stored webhook event and wait')]
 replay DELIVERY_ID:
     docker compose exec {{SERVICE}} robomp replay '{{DELIVERY_ID}}'
 

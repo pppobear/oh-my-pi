@@ -259,7 +259,8 @@ All variables are read from `.env`. Compose uses per-service explicit `environme
 | `ROBOMP_THINKING` | no (default: `high`) | `off` / `low` / `medium` / `high`. Passed to omp as `--thinking`; `off` omits the flag. |
 | `ROBOMP_PROVIDER` | no | Force a specific provider id on omp. Normally unset — `ROBOMP_MODEL` carries `<provider>/<model>`. |
 | `ROBOMP_MAX_CONCURRENCY` | no (default: `8`) | Async semaphore cap for in-flight tasks. |
-| `ROBOMP_TASK_TIMEOUT_SECONDS` | no (default: `2400`) | Hard ceiling for a single `prompt_and_wait` (one full agent turn). |
+| `ROBOMP_TASK_TIMEOUT_SECONDS` | no (default: `2400`) | Timeout passed to one full `prompt_and_wait` agent turn. |
+| `ROBOMP_TASK_TIMEOUT_HARD_GRACE_SECONDS` | no (default: `60`) | Extra wall-clock grace after `ROBOMP_TASK_TIMEOUT_SECONDS` before the worker forcibly stops a stuck RPC client. |
 | `ROBOMP_REQUEST_TIMEOUT_SECONDS` | no (default: `120`) | Per-RPC-command timeout (e.g. `set_todos`). |
 | `ROBOMP_OMP_COMMAND` | no (default: `omp`) | Executable for the agent subprocess. The shipped image installs an `omp` shim. |
 | `ROBOMP_WORKSPACE_ROOT` | no (default: `/data/workspaces` in-container) | Per-issue worktree directory. |
@@ -275,13 +276,13 @@ All variables are read from `.env`. Compose uses per-service explicit `environme
 The container's entrypoint is `python -m robomp serve`. Other subcommands:
 
 ```bash
-docker compose exec robomp robomp triage  owner/repo#123   # fetch issue live, drive full pipeline offline
+docker compose exec robomp robomp triage  owner/repo#123   # fetch issue live, enqueue it, and wait for completion
 docker compose exec robomp robomp status                   # tabular dump of the issues table
-docker compose exec robomp robomp replay  <delivery_id>    # re-enqueue a stored event (good for debugging a single delivery)
+docker compose exec robomp robomp replay  <delivery_id>    # re-enqueue a stored event and wait for completion
 docker compose exec robomp robomp cleanup owner/repo#123   # force workspace removal + state=abandoned
 ```
 
-`triage` is the workhorse for offline development — it constructs a synthetic `issues.opened` payload from the live issue and runs the whole pipeline without ever touching the webhook receiver.
+`triage` constructs a synthetic `issues.opened` payload from the live issue and queues it for the running `serve` dispatcher. Both `triage` and `replay` wait for a terminal event state, bounded by `--wait-timeout` (default: task timeout + hard grace + 30 seconds).
 
 ---
 

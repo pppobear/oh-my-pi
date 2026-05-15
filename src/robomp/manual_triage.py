@@ -5,10 +5,12 @@ Shared by the `robomp triage` CLI and the dashboard's POST /api/trigger.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from typing import Any
 
-from robomp.db import INACTIVE_EVENT_STATES, Database, issue_key
+from robomp.db import INACTIVE_EVENT_STATES, Database, EventRow, issue_key
 from robomp.github_backend import GitHubBackend
 
 _ISSUE_REF = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^#\s]+)#(?P<number>\d+)$")
@@ -29,6 +31,16 @@ class ManualTriageConflict(RuntimeError):
         self.delivery_id = delivery_id
         self.state = state
         super().__init__(f"{delivery_id} is already {state}")
+
+
+class ManualTriageTimeout(TimeoutError):
+    """Raised when a manual CLI waiter stops before terminal state."""
+
+    def __init__(self, delivery_id: str, state: str, timeout_seconds: float) -> None:
+        self.delivery_id = delivery_id
+        self.state = state
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"{delivery_id} did not reach a terminal state within {timeout_seconds:g}s (state={state})")
 
 
 def parse_issue_ref(ref: str) -> tuple[str, int]:
@@ -98,10 +110,47 @@ async def enqueue_manual_triage(*, db: Database, github: GitHubBackend, repo_ful
     return delivery
 
 
+_TERMINAL_STATES: tuple[str, ...] = ("done", "failed", "skipped")
+
+
+async def await_terminal_state(
+    db: Database,
+    delivery_id: str,
+    *,
+    poll_interval: float = 2.0,
+    timeout: float | None = None,
+) -> EventRow | None:
+    """Block until the event row reaches a terminal state, vanishes, or times out.
+
+    Pure DB polling — the caller MUST NOT spawn its own ``WorkerPool``; the
+    long-lived ``serve`` process is the only owner of the dispatcher loop.
+    Returns the final row, or ``None`` if the row was deleted while waiting.
+    Raises ``ManualTriageTimeout`` if ``timeout`` elapses first.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        row = db.get_event(delivery_id)
+        if row is None:
+            return None
+        if row.state in _TERMINAL_STATES:
+            return row
+
+        sleep_for = poll_interval
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                assert timeout is not None
+                raise ManualTriageTimeout(delivery_id, row.state, timeout)
+            sleep_for = min(poll_interval, remaining)
+        await asyncio.sleep(sleep_for)
+
+
 __all__ = [
     "InvalidIssueRef",
     "ManualTriageError",
     "ManualTriageConflict",
+    "ManualTriageTimeout",
+    "await_terminal_state",
     "build_issues_opened_payload",
     "enqueue_manual_triage",
     "manual_delivery_id",

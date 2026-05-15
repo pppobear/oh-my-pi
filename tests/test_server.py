@@ -13,9 +13,9 @@ from fastapi.testclient import TestClient
 
 from robomp.config import Settings, reset_settings_cache
 from robomp.dashboard import tail_jsonl
-from robomp.db import close_database, get_database, issue_key
+from robomp.db import Database, close_database, get_database, issue_key
 from robomp.github_client import GitHubClient
-from robomp.manual_triage import InvalidIssueRef, parse_issue_ref
+from robomp.manual_triage import InvalidIssueRef, ManualTriageTimeout, await_terminal_state, parse_issue_ref
 from robomp.sandbox import LocalGitTransport
 from robomp.server import create_app
 
@@ -194,6 +194,23 @@ def test_parse_issue_ref_rejects_garbage() -> None:
     for bad in ("widget#1", "octo/widget", "octo/widget#abc", "octo widget#1", ""):
         with pytest.raises(InvalidIssueRef):
             parse_issue_ref(bad)
+
+
+@pytest.mark.asyncio
+async def test_await_terminal_state_times_out_with_current_state(db: Database) -> None:
+    db.record_event(
+        delivery_id="d-wait",
+        event_type="issues",
+        repo="octo/widget",
+        issue_key=issue_key("octo/widget", 42),
+        payload={"action": "opened"},
+    )
+
+    with pytest.raises(ManualTriageTimeout) as excinfo:
+        await await_terminal_state(db, "d-wait", poll_interval=0.001, timeout=0.001)
+
+    assert excinfo.value.delivery_id == "d-wait"
+    assert excinfo.value.state == "queued"
 
 
 # ---------- /api/trigger ----------

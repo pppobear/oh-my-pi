@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ from robomp.db import Database, issue_key
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, RepoInfo
 from robomp.host_tools import ToolBindings
-from robomp.sandbox import GitTransport, Workspace
+from robomp.sandbox import GitTransport, Workspace, _prepare_slot_tmpdir
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +199,7 @@ def _prepare_xdg_dirs(workspace: Workspace, slot_uid: int | None) -> dict[str, s
         omp_dir.mkdir(parents=True, exist_ok=True)
         if not should_chown:
             continue
+        assert slot_uid is not None
         for path in (base, omp_dir):
             try:
                 os.chown(path, 0, slot_uid)
@@ -327,6 +329,8 @@ def _run_rpc_blocking(
             log.debug("delta", extra={"issue": bindings.issue_key, "delta": str(ev.get("delta", ""))[:200]})
 
     rpc_env = _build_extra_env(settings)
+    slot_tmpdir = str(_prepare_slot_tmpdir(inputs.workspace, inputs.slot_uid))
+    rpc_env.update({"TMPDIR": slot_tmpdir, "TMP": slot_tmpdir, "TEMP": slot_tmpdir})
     rpc_env.update(_prepare_xdg_dirs(inputs.workspace, inputs.slot_uid))
     resuming = _has_prior_session(bindings.workspace.session_dir)
     extra_args: tuple[str, ...] = ("--continue",) if resuming else ()
@@ -430,7 +434,31 @@ def _run_rpc_blocking(
                 "rpc_start",
                 extra={"issue": bindings.issue_key, "task": task_kind, "branch": bindings.workspace.branch},
             )
-            turn = client.prompt_and_wait(prompt, timeout=settings.task_timeout_seconds)
+            hard_timeout_seconds = settings.task_timeout_seconds + settings.task_timeout_hard_grace_seconds
+            hard_timeout_fired = threading.Event()
+
+            def _hard_stop() -> None:
+                hard_timeout_fired.set()
+                log.warning(
+                    "rpc_hard_timeout",
+                    extra={"issue": bindings.issue_key, "task": task_kind, "timeout": hard_timeout_seconds},
+                )
+                try:
+                    client.stop()
+                except Exception:
+                    log.exception(
+                        "rpc hard timeout stop failed", extra={"issue": bindings.issue_key, "task": task_kind}
+                    )
+
+            hard_timer = threading.Timer(hard_timeout_seconds, _hard_stop)
+            hard_timer.daemon = True
+            hard_timer.start()
+            try:
+                turn = client.prompt_and_wait(prompt, timeout=settings.task_timeout_seconds)
+            finally:
+                hard_timer.cancel()
+            if hard_timeout_fired.is_set():
+                raise TimeoutError("omp task exceeded hard timeout")
             log.info(
                 "rpc_done",
                 extra={

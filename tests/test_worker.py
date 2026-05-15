@@ -8,6 +8,7 @@ whether the workspace's omp session directory already holds a JSONL transcript.
 from __future__ import annotations
 
 import asyncio
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ class _FakeRpcClient:
         self.kwargs = kwargs
         self.set_todos_calls: list[list[dict]] = []
         self.get_todos_calls = 0
+        self.stop_calls = 0
         _FakeRpcClient.instances.append(self)
 
     def __enter__(self):
@@ -42,7 +44,7 @@ class _FakeRpcClient:
         pass
 
     def stop(self) -> None:
-        pass
+        self.stop_calls += 1
 
     def set_todos(self, phases):
         self.set_todos_calls.append(phases)
@@ -267,6 +269,12 @@ async def test_run_rpc_uses_workspace_xdg_dirs_without_slot(tmp_path: Path, sett
         path = Path(env[key])
         assert path.is_relative_to(xdg_root)
         assert (path / "omp").is_dir()
+    tmpdir = inputs.workspace.root / ".omp-tmp"
+    assert env["TMPDIR"] == str(tmpdir)
+    assert env["TMP"] == str(tmpdir)
+    assert env["TEMP"] == str(tmpdir)
+    assert tmpdir.is_dir()
+    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
 
 
 @pytest.mark.asyncio
@@ -274,8 +282,8 @@ async def test_run_rpc_chowns_workspace_xdg_dirs_for_slot(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chown_calls: list[tuple[Path, int, int]] = []
-    monkeypatch.setattr(worker.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(worker.os, "chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
+    monkeypatch.setattr("robomp.worker.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.worker.os.chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
 
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False, slot_uid=2001)
     loop = asyncio.new_event_loop()
@@ -372,3 +380,83 @@ async def test_run_rpc_passes_slot_uid_user_slot_group_and_omp_extra_group(tmp_p
     assert client_kwargs["user"] == 2001
     assert client_kwargs["group"] == 2001
     assert client_kwargs["extra_groups"] == ["omp"]
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_arms_hard_timeout_timer(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, function):
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    monkeypatch.setattr("robomp.worker.threading.Timer", FakeTimer)
+    settings.task_timeout_seconds = 3.0
+    settings.task_timeout_hard_grace_seconds = 7.0
+    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="x",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+
+    assert len(timers) == 1
+    timer = timers[0]
+    assert timer.interval == 10.0
+    assert timer.daemon is True
+    assert timer.started is True
+    assert timer.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_run_rpc_hard_timeout_stops_client_and_fails(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FiringTimer:
+        def __init__(self, interval, function):
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+            self.cancelled = False
+
+        def start(self) -> None:
+            self.function()
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    monkeypatch.setattr("robomp.worker.threading.Timer", FiringTimer)
+    inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(TimeoutError, match="hard timeout"):
+            worker._run_rpc_blocking(
+                inputs,
+                task_kind="triage_issue",
+                prompt="x",
+                loop=loop,
+                bindings=bindings,  # type: ignore[arg-type]
+            )
+    finally:
+        loop.close()
+
+    assert _FakeRpcClient.instances[0].stop_calls == 1

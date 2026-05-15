@@ -1,17 +1,41 @@
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from robomp.sandbox import SandboxManager, _chown_workspace, _share_git_metadata_with_slots, make_branch, workspace_key
+from robomp.sandbox import (
+    SandboxManager,
+    Workspace,
+    _chown_workspace,
+    _prepare_slot_tmpdir,
+    _reap_slot,
+    _share_git_metadata_with_slots,
+    _slot_pids,
+    make_branch,
+    workspace_key,
+)
 
 
 def _git(args: list[str], cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+def _workspace(root: Path) -> Workspace:
+    return Workspace(
+        root=root,
+        repo_dir=root / "repo",
+        session_dir=root / ".omp-session",
+        context_dir=root / "context",
+        artifacts_dir=root / "artifacts",
+        branch="farm/test/topic",
+        repo_full_name="octo/widget",
+        issue_number=1,
+    )
 
 
 @pytest.fixture
@@ -129,6 +153,88 @@ def test_chown_workspace_runs_chown_and_chmod_as_root_on_linux(tmp_path: Path, m
         (["chown", "-R", "0:2001", str(tmp_path)], True),
         (["chmod", "-R", "u=rwX,g=rwX,o=", str(tmp_path)], True),
     ]
+
+
+def test_slot_pids_reads_proc_status_and_skips_zombies(tmp_path: Path) -> None:
+    nonnumeric = tmp_path / "self"
+    nonnumeric.mkdir()
+
+    live = tmp_path / "123"
+    live.mkdir()
+    (live / "status").write_text(
+        "Name:\tomp\nState:\tS (sleeping)\nUid:\t0\t2001\t2001\t2001\n",
+        encoding="utf-8",
+    )
+
+    zombie = tmp_path / "124"
+    zombie.mkdir()
+    (zombie / "status").write_text(
+        "Name:\tomp\nState:\tZ (zombie)\nUid:\t2001\t2001\t2001\t2001\n",
+        encoding="utf-8",
+    )
+
+    other = tmp_path / "125"
+    other.mkdir()
+    (other / "status").write_text(
+        "Name:\troot\nState:\tS (sleeping)\nUid:\t0\t0\t0\t0\n",
+        encoding="utf-8",
+    )
+
+    assert _slot_pids(2001, tmp_path) == (123,)
+
+
+def test_reap_slot_noops_when_permissions_inactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.os.kill", lambda pid, sig: calls.append((pid, sig)))
+
+    _reap_slot(2001)
+
+    assert calls == []
+
+
+def test_reap_slot_kills_slot_uid_on_linux_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox._slot_pids", lambda _uid: (111, 222))
+    monkeypatch.setattr("robomp.sandbox.os.kill", lambda pid, sig: calls.append((pid, sig)))
+
+    _reap_slot(2001)
+
+    assert calls == [(111, signal.SIGKILL), (222, signal.SIGKILL)]
+
+
+def test_prepare_slot_tmpdir_chowns_slot_and_locks_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    chowns: list[tuple[Path, int, int]] = []
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.os.chown", lambda path, uid, gid: chowns.append((Path(path), uid, gid)))
+
+    tmpdir = _prepare_slot_tmpdir(_workspace(tmp_path), 2001)
+
+    assert tmpdir == tmp_path / ".omp-tmp"
+    assert tmpdir.is_dir()
+    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
+    assert chowns == [(tmpdir, 2001, 2001)]
+
+
+def test_prepare_slot_tmpdir_replaces_symlink_without_touching_target(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    tmpdir = tmp_path / ".omp-tmp"
+    tmpdir.symlink_to(target, target_is_directory=True)
+
+    prepared = _prepare_slot_tmpdir(_workspace(tmp_path), None)
+
+    assert prepared == tmpdir
+    assert prepared.is_dir()
+    assert not prepared.is_symlink()
+    assert target.is_dir()
 
 
 def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
