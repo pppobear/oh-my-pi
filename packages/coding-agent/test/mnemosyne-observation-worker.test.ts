@@ -98,4 +98,54 @@ describe("buildObservationChunks", () => {
 		expect(chunks[0]?.text).toContain("new fact");
 		expect(chunks[0]?.text).not.toContain("old");
 	});
+
+	test("does not treat compaction summaries after a checkpoint as fresh source evidence", () => {
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "u1",
+				parentId: null,
+				timestamp: "2026-05-31T05:00:00Z",
+				message: { role: "user", content: "user prefers boring fixes", timestamp: 0 },
+			},
+			{
+				type: "custom",
+				id: "checkpoint",
+				parentId: "u1",
+				timestamp: "2026-05-31T05:01:00Z",
+				customType: OBSERVATION_CHECKPOINT_CUSTOM_TYPE,
+				data: {
+					lastSourceEntryId: "u1",
+					observedCount: 1,
+					writtenCount: 1,
+					timestamp: "2026-05-31 05:01",
+					workerModel: "p/m",
+				},
+			},
+			{
+				type: "compaction",
+				id: "compact1",
+				parentId: "checkpoint",
+				timestamp: "2026-05-31T05:02:00Z",
+				summary: "Prior observation says user prefers boring fixes.",
+				firstKeptEntryId: "checkpoint",
+				tokensBefore: 42_000,
+			},
+			{
+				type: "message",
+				id: "u2",
+				parentId: "compact1",
+				timestamp: "2026-05-31T05:03:00Z",
+				message: { role: "user", content: "new fact after compaction", timestamp: 0 },
+			},
+		];
+		const checkpoint = findObservationCheckpoint(entries);
+		const chunks = buildObservationChunks(entries, { afterEntryId: checkpoint?.lastSourceEntryId });
+
+		expect(chunks).toHaveLength(1);
+		expect(chunks[0]?.sourceEntryIds).toEqual(["u2"]);
+		expect(chunks[0]?.text).toContain("new fact after compaction");
+		expect(chunks[0]?.text).not.toContain("Prior observation");
+		expect(chunks[0]?.text).not.toContain("compact1");
+	});
 });

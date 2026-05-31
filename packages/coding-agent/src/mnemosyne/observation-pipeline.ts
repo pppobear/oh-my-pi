@@ -160,7 +160,9 @@ function entryContent(entry: SessionEntry): string | undefined {
 		case "branch_summary":
 			return normalizeText(entry.summary);
 		case "compaction":
-			return normalizeText(entry.summary);
+			// Compaction summaries collapse earlier entries; re-observing them would replace
+			// source-addressed evidence with the compaction entry id after every compaction.
+			return undefined;
 		case "custom_message":
 			return typeof entry.content === "string" ? normalizeText(entry.content) : normalizeText(textBlocks(entry.content));
 		default:
