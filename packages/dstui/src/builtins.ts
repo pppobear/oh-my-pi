@@ -113,8 +113,8 @@ export function installBuiltins(env: Env, limits: Readonly<DstuiLimits>): void {
 		return false;
 	});
 	env.set("not", (a: unknown) => !a);
-	env.set("and", (...args: unknown[]) => args.every(Boolean));
-	env.set("or", (...args: unknown[]) => args.find(Boolean) ?? false);
+	// `and` / `or` are special forms in the evaluator (short-circuit semantics);
+	// do not bind them here.
 
 	// Strings -------------------------------------------------------------
 	env.set("str", (...args: unknown[]) => {

@@ -60,12 +60,21 @@ export class StoreQuotaError extends Error {
 	}
 }
 
+/** Thrown when a state blob is not JSON-encodable (function, symbol, BigInt, etc.). */
+export class StoreEncodingError extends Error {
+	constructor(reason: string) {
+		super(`dstui store state is not JSON-encodable: ${reason}`);
+		this.name = "StoreEncodingError";
+	}
+}
+
 function assertName(name: string): void {
 	if (!NAME_PATTERN.test(name)) throw new StoreNameError(name);
 }
+const ENCODER = new TextEncoder();
 
 function byteLength(text: string): number {
-	return Buffer.byteLength(text, "utf8");
+	return ENCODER.encode(text).byteLength;
 }
 
 async function writeAtomic(target: string, content: string): Promise<void> {
@@ -130,7 +139,17 @@ export class DstuiStore {
 			await fs.rm(target, { force: true });
 			return;
 		}
-		const encoded = JSON.stringify(state);
+		let encoded: string | undefined;
+		try {
+			encoded = JSON.stringify(state);
+		} catch (err) {
+			throw new StoreEncodingError(err instanceof Error ? err.message : String(err));
+		}
+		if (typeof encoded !== "string") {
+			throw new StoreEncodingError(
+				`JSON.stringify returned ${encoded === undefined ? "undefined" : typeof encoded}`,
+			);
+		}
 		const bytes = byteLength(encoded);
 		if (bytes > this.#maxStateBytes) {
 			throw new StoreQuotaError("state", bytes, this.#maxStateBytes);

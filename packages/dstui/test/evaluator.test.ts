@@ -63,6 +63,10 @@ describe("evaluator", () => {
 		expect(() => run("(set! constructor 1)")).toThrow(EvaluationError);
 	});
 
+	test("set! on unbound symbol throws (no implicit binding creation)", () => {
+		expect(() => run("(set! x 99)")).toThrow(/unbound/);
+	});
+
 	test("assertSafeKey rejects every forbidden key", () => {
 		for (const key in FORBIDDEN_KEYS) {
 			expect(() => assertSafeKey(key)).toThrow(EvaluationError);
@@ -87,5 +91,17 @@ describe("evaluator", () => {
 		expect(() => run("(globalThis)")).toThrow(EvaluationError);
 		expect(() => run("(eval 1)")).toThrow(EvaluationError);
 		expect(() => run("(Function 1)")).toThrow(EvaluationError);
+	});
+
+	test("and/or short-circuit and do not evaluate later args", () => {
+		// `set!` would mutate `x` if evaluated; short-circuit must skip it.
+		expect(run(`(let ((x 0)) (and false (set! x 99)) x)`)).toBe(0);
+		expect(run(`(let ((x 0)) (or  true  (set! x 99)) x)`)).toBe(0);
+		// Last value returned (Clojure/Scheme style), not coerced to bool.
+		expect(run(`(and 1 2 3)`)).toBe(3);
+		expect(run(`(or  0 false 7)`)).toBe(7);
+		// Empty arglists match Clojure: (and) -> true, (or) -> false.
+		expect(run(`(and)`)).toBe(true);
+		expect(run(`(or)`)).toBe(false);
 	});
 });

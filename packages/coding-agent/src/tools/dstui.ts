@@ -4,7 +4,7 @@
  * The tool is gated behind two preconditions, checked at registration
  * time via {@link DstuiTool.createIf}:
  *
- *   1. `dstui.enabled` setting is `true` (default `false`).
+ *   1. `dstui.enabled` setting is `true` (default `true`; users opt out via `omp config set dstui.enabled false`).
  *   2. The current session has an interactive UI (`session.hasUI`).
  *
  * The DSL itself enforces parser/evaluator caps, output cell limits,
@@ -53,22 +53,25 @@ export class DstuiTool implements AgentTool<typeof dstuiSchema, DstuiToolDetails
 	readonly approval = "read" as const;
 	readonly label = "DSTUI";
 	readonly summary = "Mount a safe pi-dstui DSL component as a TUI overlay";
-	readonly description: string;
+	readonly description: string = prompt.render(dstuiDescription);
 	readonly parameters = dstuiSchema;
 	readonly strict = true;
 	readonly loadMode = "discoverable" as const;
 
-	readonly #store: DstuiStore;
+	static #sharedStore: DstuiStore | undefined;
 
-	constructor(readonly _session: ToolSession) {
-		this.description = prompt.render(dstuiDescription);
-		this.#store = new DstuiStore({ root: path.join(getConfigRootDir(), "dstui") });
+	static #store(): DstuiStore {
+		if (!DstuiTool.#sharedStore) {
+			DstuiTool.#sharedStore = new DstuiStore({ root: path.join(getConfigRootDir(), "dstui") });
+		}
+		return DstuiTool.#sharedStore;
 	}
+
 
 	static createIf(session: ToolSession): DstuiTool | null {
 		if (!session.hasUI) return null;
 		if (!session.settings.get("dstui.enabled")) return null;
-		return new DstuiTool(session);
+		return new DstuiTool();
 	}
 
 	async execute(
@@ -93,12 +96,12 @@ export class DstuiTool implements AgentTool<typeof dstuiSchema, DstuiToolDetails
 		let detailSource: DstuiToolDetails["source"];
 		try {
 			if (params.source && params.store && params.save) {
-				await this.#store.saveModule(params.store, params.source);
+				await DstuiTool.#store().saveModule(params.store, params.source);
 			}
 			if (params.source && !params.save) {
 				detailSource = "inline";
 			} else if (params.store) {
-				const entry = await this.#store.loadModule(params.store);
+				const entry = await DstuiTool.#store().loadModule(params.store);
 				if (!entry) {
 					return {
 						content: [
@@ -145,7 +148,7 @@ export class DstuiTool implements AgentTool<typeof dstuiSchema, DstuiToolDetails
 
 		if (params.store && params.saveState && settle.reason === "emit") {
 			try {
-				await this.#store.saveState(params.store, settle.value);
+				await DstuiTool.#store().saveState(params.store, settle.value);
 			} catch {
 				// State-persist failure must not corrupt the settle return; the model can retry.
 			}

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { DstuiStore, StoreNameError, StoreQuotaError } from "../src/store";
+import { DstuiStore, StoreEncodingError, StoreNameError, StoreQuotaError } from "../src/store";
 
 async function makeTempRoot(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "dstui-store-"));
@@ -78,6 +78,21 @@ describe("DstuiStore", () => {
 		);
 		const entry = await small.loadModule("picker");
 		expect(entry?.state).toBeUndefined();
+	});
+
+	test("saveState rejects unencodable values with StoreEncodingError", async () => {
+		await store.saveModule("picker", VALID_SOURCE);
+		await expect(store.saveState("picker", () => null)).rejects.toThrow(StoreEncodingError);
+		await expect(store.saveState("picker", Symbol("nope"))).rejects.toThrow(StoreEncodingError);
+		await expect(store.saveState("picker", 1n)).rejects.toThrow(StoreEncodingError);
+	});
+
+	test("saveState accepts encodable atoms (number, string, bool, null)", async () => {
+		await store.saveModule("picker", VALID_SOURCE);
+		await store.saveState("picker", 7);
+		expect((await store.loadModule("picker"))?.state).toBe(7);
+		await store.saveState("picker", null);
+		expect((await store.loadModule("picker"))?.state).toBeNull();
 	});
 
 	test("loadModule recompiles so corrupt source surfaces as an error", async () => {

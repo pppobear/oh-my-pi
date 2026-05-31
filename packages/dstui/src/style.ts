@@ -39,12 +39,14 @@ const STYLE_OPEN: Readonly<Record<StyleName, string>> = Object.freeze({
 
 const STYLE_RESET = "\x1b[0m";
 
-const STYLE_NAMES: ReadonlySet<string> = new Set(Object.keys(STYLE_OPEN));
+const STYLE_NAMES: Readonly<Record<string, true>> = Object.freeze(
+	Object.fromEntries(Object.keys(STYLE_OPEN).map(name => [name, true as const])) as Record<StyleName, true>,
+) as Readonly<Record<string, true>>;
 
 /** Map a raw DSL style value (Kw or string) to its registered name, or `undefined`. */
 export function resolveStyleName(style: unknown): StyleName | undefined {
-	if (style instanceof Kw && STYLE_NAMES.has(style.name)) return style.name as StyleName;
-	if (typeof style === "string" && STYLE_NAMES.has(style)) return style as StyleName;
+	if (style instanceof Kw && Object.hasOwn(STYLE_NAMES, style.name)) return style.name as StyleName;
+	if (typeof style === "string" && Object.hasOwn(STYLE_NAMES, style)) return style as StyleName;
 	return undefined;
 }
 

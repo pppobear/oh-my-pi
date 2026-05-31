@@ -119,7 +119,10 @@ export function instantiate(
 		env.set(param, value);
 	}
 
+	// Each slot evaluates against a fresh per-cycle budget; otherwise a heavy
+	// early slot could starve later slots when both share the cap.
 	for (const slot of def.stateDefs) {
+		budget.reset();
 		env.set(slot.name, evaluate(slot.expr, env, budget));
 	}
 

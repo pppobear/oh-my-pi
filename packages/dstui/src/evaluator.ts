@@ -224,7 +224,7 @@ export function evaluate(expr: SExpr, env: Env, budget: Budget): unknown {
 		assertSafeKey(target.name);
 		const value = evaluate(expr[2] ?? null, env, budget);
 		if (!env.update(target.name, value)) {
-			env.set(target.name, value);
+			throw new EvaluationError(`set! target is unbound: ${target.name}`);
 		}
 		return value;
 	}
@@ -271,6 +271,24 @@ export function evaluate(expr: SExpr, env: Env, budget: Budget): unknown {
 		const cancel = env.get(CANCEL_SLOT) as (() => void) | undefined;
 		cancel?.();
 		return null;
+	}
+
+	if (isSym(head, "and")) {
+		let result: unknown = true;
+		for (let i = 1; i < expr.length; i++) {
+			result = evaluate(expr[i] ?? null, env, budget);
+			if (!result) return result;
+		}
+		return result;
+	}
+
+	if (isSym(head, "or")) {
+		let result: unknown = false;
+		for (let i = 1; i < expr.length; i++) {
+			result = evaluate(expr[i] ?? null, env, budget);
+			if (result) return result;
+		}
+		return result;
 	}
 
 	// General application ----------------------------------------------------
