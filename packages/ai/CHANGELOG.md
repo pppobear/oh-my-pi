@@ -2,7 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed tool argument validation to parse JSON-stringified arrays/objects even when a permissive union branch also accepts strings, preventing providers that serialize array tool parameters as strings from turning path arrays into literal paths. ([#1518](https://github.com/can1357/oh-my-pi/issues/1518))
+
 ## [15.5.12] - 2026-05-29
+
 ### Removed
 
 - Removed ANTML stream markup healing for `antml:function_calls` and `antml:thinking` envelopes, so Anthropic-compatible providers no longer parse those tags into `toolCall`/`thinking` events

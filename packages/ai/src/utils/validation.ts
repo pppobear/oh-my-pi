@@ -546,6 +546,54 @@ function deleteAtSegment(node: unknown, segments: string[], depth: number): unkn
 // JSON-Schema-driven normalization passes (LLM quirks).
 // ============================================================================
 
+function tryParseJsonContainerForSchema(schema: unknown, value: unknown): { value: unknown; changed: boolean } {
+	if (typeof value !== "string") return { value, changed: false };
+	const parsed = tryParseJsonForTypes(value, ["array", "object"]);
+	if (!parsed.changed) return { value, changed: false };
+	return isJsonSchemaValueValid(schema, parsed.value) ? parsed : { value, changed: false };
+}
+
+function collectPropertySchemas(schema: unknown, property: string, out: unknown[] = []): unknown[] {
+	if (!isPlainRecord(schema)) return out;
+	const properties = schema.properties;
+	if (isPlainRecord(properties) && Object.hasOwn(properties, property)) {
+		out.push(properties[property]);
+	}
+	for (const key of ["anyOf", "oneOf", "allOf"] as const) {
+		const branches = schema[key];
+		if (!Array.isArray(branches)) continue;
+		for (const branch of branches) collectPropertySchemas(branch, property, out);
+	}
+	return out;
+}
+
+function normalizeStringifiedContainersForSchema(
+	schema: unknown,
+	value: unknown,
+): { value: unknown; changed: boolean } {
+	const direct = tryParseJsonContainerForSchema(schema, value);
+	if (direct.changed) return direct;
+
+	if (!isPlainRecord(value)) return { value, changed: false };
+
+	let changed = false;
+	let next: Record<string, unknown> | undefined;
+	for (const [key, current] of Object.entries(value)) {
+		const propertySchemas = collectPropertySchemas(schema, key);
+		if (propertySchemas.length === 0) continue;
+		for (const propertySchema of propertySchemas) {
+			const normalized = normalizeStringifiedContainersForSchema(propertySchema, current);
+			if (!normalized.changed) continue;
+			if (!next) next = { ...value };
+			next[key] = normalized.value;
+			changed = true;
+			break;
+		}
+	}
+
+	return changed ? { value: next ?? value, changed: true } : { value, changed: false };
+}
+
 /**
  * Test a JSON-Schema branch during nullable normalization. Kept deliberately
  * small and synchronous so validation does not need to compile legacy schemas
@@ -971,13 +1019,18 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 	const { json } = ctx;
 
 	// Always normalize first — strip null and string "null" from optional
-	// fields and substitute defaults. Handles LLM outputting string "null"
-	// to mean "no value" even when validation would otherwise pass.
+	// fields and substitute defaults. Then parse JSON-stringified containers
+	// that would otherwise pass through a permissive string union branch.
 	let normalizedArgs: unknown = originalArgs;
 	let changed = false;
-	const initialNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
-	if (initialNormalization.changed) {
-		normalizedArgs = initialNormalization.value;
+	const initialNullNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
+	if (initialNullNormalization.changed) {
+		normalizedArgs = initialNullNormalization.value;
+		changed = true;
+	}
+	const initialContainerNormalization = normalizeStringifiedContainersForSchema(json, normalizedArgs);
+	if (initialContainerNormalization.changed) {
+		normalizedArgs = initialContainerNormalization.value;
 		changed = true;
 	}
 
@@ -994,6 +1047,12 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 		const nullNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 		if (nullNormalization.changed) {
 			normalizedArgs = nullNormalization.value;
+			changed = true;
+		}
+		const containerNormalization = normalizeStringifiedContainersForSchema(json, normalizedArgs);
+		if (containerNormalization.changed) {
+			normalizedArgs = containerNormalization.value;
+			changed = true;
 		}
 
 		result = validateContext(ctx, normalizedArgs);

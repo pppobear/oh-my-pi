@@ -178,6 +178,32 @@ describe("tool path arrays", () => {
 		expect(details?.scopePath).toBe("folder with spaces");
 	});
 
+	it("search coerces JSON-stringified path arrays from tool validation", async () => {
+		const tools = await createTools(createTestSession(tempDir));
+		const tool = tools.find(entry => entry.name === "search");
+		expect(tool).toBeDefined();
+		if (!tool) throw new Error("Missing search tool");
+
+		const args = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "search-json-string-path-array",
+			name: tool.name,
+			arguments: {
+				pattern: "shared-needle",
+				paths: JSON.stringify(["apps/", "packages/"]),
+			},
+		});
+		const result = await tool.execute("search-json-string-path-array", args);
+		const text = getText(result);
+		const details = result.details as { fileCount?: number; scopePath?: string } | undefined;
+
+		expect(text).toContain("shared-needle apps");
+		expect(text).toContain("shared-needle packages");
+		expect(text).not.toContain("shared-needle phases");
+		expect(details?.fileCount).toBe(2);
+		expect(details?.scopePath).toBe("apps/, packages/");
+	});
+
 	it("search pending renderer accepts a single string path", () => {
 		const component = searchToolRenderer.renderCall(
 			{ pattern: "space-needle", paths: "folder with spaces/" },

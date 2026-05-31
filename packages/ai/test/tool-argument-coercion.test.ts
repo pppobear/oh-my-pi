@@ -78,6 +78,50 @@ describe("Tool argument coercion", () => {
 		expect(result.payload).toEqual({ a: 1 });
 	});
 
+	it("parses JSON arrays in string values when a union also accepts strings", () => {
+		const tool: Tool = {
+			name: "search-like",
+			description: "",
+			parameters: z.object({
+				paths: z.union([z.string(), z.array(z.string()).min(1)]),
+				pattern: z.string(),
+			}),
+		};
+
+		const toolCall: ToolCall = {
+			type: "toolCall",
+			id: "call-search-like",
+			name: "search-like",
+			arguments: {
+				paths: '["D:/WorkSpace/test_search.py"]',
+				pattern: "def greet",
+			},
+		};
+
+		const result = validateToolArguments(tool, toolCall) as { paths: string[]; pattern: string };
+		expect(result).toEqual({
+			paths: ["D:/WorkSpace/test_search.py"],
+			pattern: "def greet",
+		});
+	});
+
+	it("preserves JSON-looking strings when no container branch is valid", () => {
+		const tool: Tool = {
+			name: "string-only",
+			description: "",
+			parameters: z.object({ label: z.string() }),
+		};
+
+		const result = validateToolArguments(tool, {
+			type: "toolCall",
+			id: "call-string-only",
+			name: "string-only",
+			arguments: { label: '["literal"]' },
+		}) as { label: string };
+
+		expect(result.label).toBe('["literal"]');
+	});
+
 	it("preserves unknown root fields after Zod validation so tools can reject disabled arguments", () => {
 		const tool: Tool = {
 			name: "t4b",
