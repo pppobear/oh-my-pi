@@ -147,6 +147,8 @@ If `skills.enableSkillCommands` is true, interactive mode registers one slash co
   - **Enter** → invokes the skill on the `steer` queue while streaming (matches free-text Enter, which also steers), or as a normal idle prompt when the agent is not streaming
   - **Ctrl+Enter** (`app.message.followUp`) → invokes the skill on the `followUp` queue while streaming, or as a normal idle prompt when the agent is not streaming
 - appends metadata (`Skill: <path>`, optional `User: <args>`)
+- args capture: everything after the first **space** is the arg string, verbatim — newlines included. `indexOf(" ")` is the only delimiter; there is no escape sequence and no way to mix unrelated trailing prose with a skill invocation. To send free prose alongside a skill, invoke the skill bare (`/skill:name`) and send the prose as a separate turn.
+- magic-keyword scan: the args are scanned for the editor's gradient-highlighted keywords (`ultrathink`, `orchestrate`, `workflowz`) and the `+Nk` turn-budget directive, so `/skill:foo workflowz compare …` injects the workflow notice just as a plain `workflowz compare …` message would. Keywords inside the **skill body** are never scanned — that text belongs to the skill author, not the user — so a body that mentions `orchestrate` in prose does not silently enable orchestration mode.
 
 There is no flag, mode-selector, or frontmatter knob to override this — the keybinding _is_ the choice, identical to how free text is routed during streaming (`input-controller.ts:243-249` for Enter, `input-controller.ts:462-500` for Ctrl+Enter; both dispatch through `#invokeSkillCommand`).
 

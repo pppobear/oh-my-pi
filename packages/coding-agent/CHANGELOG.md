@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed magic keywords (`ultrathink`, `orchestrate`, `workflowz`) and the `+Nk` turn-budget directive being silently inert when typed inside a `/skill:<name> …` invocation. Skill dispatch routes through `AgentSession.promptCustomMessage`, which never ran the keyword/budget scan that `prompt()` runs on user input — so a highlighted keyword in skill args looked active in the editor but never injected its hidden system notice. `promptCustomMessage` now accepts an optional `keywordText` parameter; both skill dispatch sites (interactive `InputController.#invokeSkillCommand` and `AcpAgent.#tryRunSkillCommand`) pass the user-typed args, so a highlighted `workflowz`/`orchestrate`/`ultrathink`/`+500k` in `/skill:foo workflowz compare …` now takes effect ([#2126](https://github.com/can1357/oh-my-pi/issues/2126)).
+
 ## [15.10.5] - 2026-06-08
 
 ### Added

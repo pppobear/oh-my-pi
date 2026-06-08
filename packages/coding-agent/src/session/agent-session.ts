@@ -163,12 +163,10 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
-import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
+import { scanMagicKeywords } from "../modes/magic-keyword-notices";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
-import { parseTurnBudget } from "../modes/turn-budget";
-import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
+import { containsUltrathink } from "../modes/ultrathink";
 import { computeNonMessageTokens } from "../modes/utils/context-usage";
-import { containsWorkflow, WORKFLOW_NOTICE } from "../modes/workflow";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
@@ -4373,44 +4371,14 @@ export class AgentSession {
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
 
-		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
-		// user's message that steer this turn. User-authored prompts only — synthetic /
+		// Magic keywords (`ultrathink`, `orchestrate`, `workflowz`) and the `+Nk`
+		// turn-budget directive: scan user-authored prompts only. Synthetic /
 		// agent-initiated turns never trigger them.
-		const keywordNotices: CustomMessage[] = [];
+		let keywordNotices: CustomMessage[] = [];
 		if (!options?.synthetic) {
-			const timestamp = Date.now();
-			const turnBudget = parseTurnBudget(expandedText);
-			this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
-			if (containsUltrathink(expandedText)) {
-				keywordNotices.push({
-					role: "custom",
-					customType: "ultrathink-notice",
-					content: ULTRATHINK_NOTICE,
-					display: false,
-					attribution: "user",
-					timestamp,
-				});
-			}
-			if (containsOrchestrate(expandedText)) {
-				keywordNotices.push({
-					role: "custom",
-					customType: "orchestrate-notice",
-					content: ORCHESTRATE_NOTICE,
-					display: false,
-					attribution: "user",
-					timestamp,
-				});
-			}
-			if (containsWorkflow(expandedText)) {
-				keywordNotices.push({
-					role: "custom",
-					customType: "workflow-notice",
-					content: WORKFLOW_NOTICE,
-					display: false,
-					attribution: "user",
-					timestamp,
-				});
-			}
+			const scan = scanMagicKeywords(expandedText);
+			this.sessionManager.beginTurnBudget(scan.turnBudget?.total ?? null, scan.turnBudget?.hard ?? false);
+			keywordNotices = scan.notices;
 		}
 
 		// If streaming, queue via steer() or followUp() based on option
@@ -4471,7 +4439,19 @@ export class AgentSession {
 
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice">,
+		options?: Pick<PromptOptions, "streamingBehavior" | "toolChoice"> & {
+			/**
+			 * User-typed prose to scan for magic keywords (`ultrathink`,
+			 * `orchestrate`, `workflowz`) and a `+Nk` turn-budget directive.
+			 * Skill dispatch (`/skill:<name> …`) routes here instead of through
+			 * `prompt()`, so without this hook a highlighted keyword inside the
+			 * skill args would be inert despite the editor painting it (#2126).
+			 * Passing the trimmed args here lets the keyword scan run on the
+			 * user-authored fragment of the message — never the skill body
+			 * (which is owned by the skill author).
+			 */
+			keywordText?: string;
+		},
 	): Promise<void> {
 		const textContent =
 			typeof message.content === "string"
@@ -4481,11 +4461,23 @@ export class AgentSession {
 						.map(content => content.text)
 						.join("");
 
+		let keywordNotices: CustomMessage[] = [];
+		if (options?.keywordText) {
+			const scan = scanMagicKeywords(options.keywordText);
+			this.sessionManager.beginTurnBudget(scan.turnBudget?.total ?? null, scan.turnBudget?.hard ?? false);
+			keywordNotices = scan.notices;
+		}
+
 		if (this.isStreaming) {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
 			await this.sendCustomMessage(message, { deliverAs: options.streamingBehavior });
+			// Steer/follow-up the keyword notices alongside the queued custom message
+			// so they reach the same turn the user just dispatched.
+			for (const notice of keywordNotices) {
+				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+			}
 			return;
 		}
 
@@ -4499,7 +4491,10 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 
-		await this.#promptWithMessage(customMessage, textContent, options);
+		await this.#promptWithMessage(customMessage, textContent, {
+			...options,
+			appendMessages: keywordNotices.length > 0 ? keywordNotices : undefined,
+		});
 	}
 
 	async #promptWithMessage(

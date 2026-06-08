@@ -718,13 +718,16 @@ export class AcpAgent implements Agent {
 			return false;
 		}
 		const built = await buildSkillPromptMessage(skill, args);
-		await record.session.promptCustomMessage({
-			customType: SKILL_PROMPT_MESSAGE_TYPE,
-			content: built.message,
-			display: true,
-			details: built.details,
-			attribution: "user",
-		});
+		await record.session.promptCustomMessage(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: built.message,
+				display: true,
+				details: built.details,
+				attribution: "user",
+			},
+			{ keywordText: args },
+		);
 		return true;
 	}
 

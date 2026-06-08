@@ -609,7 +609,7 @@ export class InputController {
 					details,
 					attribution: "user",
 				},
-				{ streamingBehavior },
+				{ streamingBehavior, keywordText: args },
 			);
 			if (this.ctx.session.isStreaming) {
 				this.ctx.updatePendingMessagesDisplay();
