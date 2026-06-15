@@ -149,8 +149,20 @@ const RPC_BACKGROUND_DEFAULTED_SETTING_PATHS: SettingPath[] = [
 	"bash.autoBackground.thresholdMs",
 ];
 
+// Some legacy settings are both a leaf setting and a parent for a newer nested
+// setting; defaulting the child must not replace an explicitly configured scalar parent.
+const DEFAULT_OVERRIDE_PARENT_PATHS: Partial<Record<SettingPath, SettingPath>> = {
+	"todo.reminders.max": "todo.reminders",
+};
+
+function hasConfiguredOverridePath(settingPath: SettingPath, targetSettings: Settings): boolean {
+	const parentPath = DEFAULT_OVERRIDE_PARENT_PATHS[settingPath];
+	return targetSettings.isConfigured(settingPath) || (!!parentPath && targetSettings.isConfigured(parentPath));
+}
+
 function applyDefaultSettingOverrides(settingPaths: SettingPath[], targetSettings: Settings): void {
 	for (const settingPath of settingPaths) {
+		if (hasConfiguredOverridePath(settingPath, targetSettings)) continue;
 		targetSettings.override(settingPath, getDefault(settingPath));
 	}
 }
