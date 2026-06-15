@@ -6771,13 +6771,31 @@ export class AgentSession {
 		return tokens;
 	}
 
+	#estimatePrePromptContextTokens(messages: AgentMessage[], contextWindow: number): number {
+		const currentUsage = this.getContextUsage({ contextWindow });
+		if (typeof currentUsage?.tokens !== "number" || !Number.isFinite(currentUsage.tokens)) {
+			return this.#estimatePendingPromptTokens(messages);
+		}
+
+		const currentEstimate = this.#estimateContextTokens();
+		if (!currentEstimate.providerAnchored) {
+			return this.#estimatePendingPromptTokens(messages);
+		}
+
+		let tokens = currentUsage.tokens;
+		for (const message of messages) {
+			tokens += estimateTokens(message);
+		}
+		return tokens;
+	}
+
 	async #runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
 		const model = this.model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.settings.getGroup("compaction");
-		const contextTokens = this.#estimatePendingPromptTokens(messages);
+		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
 
 		// Auto-promote first: switching to a larger-context model avoids compacting
@@ -10528,6 +10546,7 @@ export class AgentSession {
 	 */
 	#estimateContextTokens(): {
 		tokens: number;
+		providerAnchored: boolean;
 	} {
 		const messages = this.messages;
 
@@ -10554,6 +10573,7 @@ export class AgentSession {
 			}
 			return {
 				tokens: estimated,
+				providerAnchored: false,
 			};
 		}
 
@@ -10565,6 +10585,7 @@ export class AgentSession {
 
 		return {
 			tokens: usageTokens + trailingTokens,
+			providerAnchored: true,
 		};
 	}
 
