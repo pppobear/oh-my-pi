@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed model switches to providers with lower image caps by clamping the transient outgoing context to the target provider's image budget, preserving text history and the newest images instead of wedging the session on a provider 400. ([#3227](https://github.com/can1357/oh-my-pi/issues/3227))
+
 ## [16.1.12] - 2026-06-21
 
 ### Changed

@@ -113,6 +113,7 @@ import {
 	USER_INTERRUPT_LABEL,
 	wrapSteeringForModel,
 } from "./session/messages";
+import { clampProviderContextImages } from "./session/provider-image-budget";
 import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
 import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
@@ -2417,7 +2418,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		// Per-request provider-context transforms. Obfuscate FIRST so secrets are
 		// redacted from text before snapcompact rasterizes it into PNG frames.
-		// Both operate on the transient outgoing Context only — never persisted.
+		// All transforms operate on the transient outgoing Context only — never persisted.
 		const snapcompactSystemPromptMode = settings.get("snapcompact.systemPrompt");
 		const snapcompactInline =
 			snapcompactSystemPromptMode !== "none" || settings.get("snapcompact.toolResults")
@@ -2432,14 +2433,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						createSnapcompactSavingsRecorder(() => sessionManager.getSessionFile() ?? null),
 					)
 				: undefined;
-		const transformProviderContext =
-			obfuscator || snapcompactInline
-				? async (context: Context, transformModel: Model): Promise<Context> => {
-						let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
-						if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
-						return transformed;
-					}
-				: undefined;
+		const transformProviderContext = async (context: Context, transformModel: Model): Promise<Context> => {
+			let transformed = obfuscator ? obfuscateProviderContext(obfuscator, context) : context;
+			if (snapcompactInline) transformed = await snapcompactInline.transform(transformed, transformModel);
+			return clampProviderContextImages(transformed, transformModel);
+		};
 		const onPayload = async (payload: unknown, _model?: Model) => {
 			return await extensionRunner.emitBeforeProviderRequest(payload);
 		};
