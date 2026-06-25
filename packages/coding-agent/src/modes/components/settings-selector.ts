@@ -42,6 +42,7 @@ import type {
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
+import { loadOpenVikingConfig, type OpenVikingConfig } from "../../openviking/config";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
@@ -424,6 +425,8 @@ export class SettingsSelectorComponent implements Component {
 	#searchFirstMatch = new Map<string, string>();
 	#textInputActive = false;
 	#hasSectionJump = false;
+	#openVikingEffectiveConfig: OpenVikingConfig | null = null;
+	#openVikingEffectiveRequestId = 0;
 	// Frame geometry from the last render, for mouse hit-testing (the
 	// fullscreen overlay paints from screen row 0, so mouse rows map 1:1).
 	#tabRowStart = 0;
@@ -452,6 +455,7 @@ export class SettingsSelectorComponent implements Component {
 
 		// Initialize with first tab
 		this.#switchToTab("appearance");
+		void this.#refreshOpenVikingEffectiveConfig();
 	}
 
 	invalidate(): void {
@@ -768,6 +772,40 @@ export class SettingsSelectorComponent implements Component {
 		if (def) this.#tabBar.setActiveById(def.tab);
 	}
 
+	#maybeRefreshOpenVikingEffectiveConfig(path: SettingPath): void {
+		if (path === "memory.backend" || path.startsWith("openviking.")) {
+			void this.#refreshOpenVikingEffectiveConfig();
+		}
+	}
+
+	async #refreshOpenVikingEffectiveConfig(): Promise<void> {
+		const requestId = ++this.#openVikingEffectiveRequestId;
+		if (settings.get("memory.backend") !== "openviking") {
+			this.#openVikingEffectiveConfig = null;
+			this.#refreshOpenVikingItems();
+			return;
+		}
+		try {
+			const config = await loadOpenVikingConfig(settings);
+			if (requestId !== this.#openVikingEffectiveRequestId) return;
+			this.#openVikingEffectiveConfig = config;
+		} catch {
+			if (requestId !== this.#openVikingEffectiveRequestId) return;
+			this.#openVikingEffectiveConfig = null;
+		}
+		this.#refreshOpenVikingItems();
+		this.context.requestRender?.();
+	}
+
+	#refreshOpenVikingItems(): void {
+		if (this.#searchList) {
+			this.#setSearchQuery(this.#searchQuery);
+			return;
+		}
+		if (this.#currentTabId !== "memory" || !this.#currentList) return;
+		this.#refreshCurrentTabItems(getSettingsForTab("memory"));
+	}
+
 	/** Value-change dispatch for the search result list (any tab's setting). */
 	#onSearchSettingChange(path: SettingPath, newValue: string): void {
 		const def = getSettingDef(path);
@@ -780,6 +818,7 @@ export class SettingsSelectorComponent implements Component {
 			settings.set(path, newValue as never);
 			this.callbacks.onChange(path, newValue);
 		}
+		this.#maybeRefreshOpenVikingEffectiveConfig(path);
 		// Submenu/text types already persisted inside their own done callbacks.
 		if (def.tab === "appearance") {
 			this.#triggerStatusLinePreview();
@@ -800,6 +839,7 @@ export class SettingsSelectorComponent implements Component {
 
 		const currentValue = this.#getCurrentValue(def);
 		const changed = this.#isChanged(def, currentValue);
+		const displayValue = this.#getOpenVikingEffectiveDisplayValue(def.path);
 
 		switch (def.type) {
 			case "boolean":
@@ -808,6 +848,7 @@ export class SettingsSelectorComponent implements Component {
 					label: def.label,
 					description: def.description,
 					currentValue: currentValue ? "true" : "false",
+					displayValue,
 					values: ["true", "false"],
 					changed,
 				};
@@ -818,6 +859,7 @@ export class SettingsSelectorComponent implements Component {
 					label: def.label,
 					description: def.description,
 					currentValue: String(currentValue ?? ""),
+					displayValue,
 					values: [...def.values],
 					changed,
 				};
@@ -828,6 +870,7 @@ export class SettingsSelectorComponent implements Component {
 					label: def.label,
 					description: def.description,
 					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
+					displayValue,
 					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
 					changed,
 				};
@@ -838,6 +881,7 @@ export class SettingsSelectorComponent implements Component {
 					label: def.label,
 					description: def.description,
 					currentValue: this.#formatTextInputValue(def.path, currentValue),
+					displayValue,
 					submenu: (cv, done) => this.#createTextInput(def, cv, done),
 					changed,
 				};
@@ -863,6 +907,54 @@ export class SettingsSelectorComponent implements Component {
 
 	#isChanged(def: SettingDef, currentValue: unknown): boolean {
 		return !Object.is(currentValue, getDefault(def.path));
+	}
+
+	#getOpenVikingEffectiveDisplayValue(path: SettingPath): string | undefined {
+		if (!path.startsWith("openviking.") || settings.get("memory.backend") !== "openviking") return undefined;
+		const config = this.#openVikingEffectiveConfig;
+		if (!config) return undefined;
+		switch (path) {
+			case "openviking.apiUrl":
+				return config.baseUrl;
+			case "openviking.apiKey":
+				return config.apiKey ? "(configured)" : "";
+			case "openviking.account":
+				return config.accountId ?? "";
+			case "openviking.user":
+				return config.userId ?? "";
+			case "openviking.peerId":
+				return config.peerId ?? "";
+			case "openviking.autoRecall":
+				return String(config.autoRecall);
+			case "openviking.autoRetain":
+				return String(config.autoRetain);
+			case "openviking.recallLimit":
+				return String(config.recallLimit);
+			case "openviking.scoreThreshold":
+				return String(config.scoreThreshold);
+			case "openviking.minQueryLength":
+				return String(config.minQueryLength);
+			case "openviking.recallMaxContentChars":
+				return String(config.recallMaxContentChars);
+			case "openviking.recallTokenBudget":
+				return String(config.recallTokenBudget);
+			case "openviking.recallPreferAbstract":
+				return String(config.recallPreferAbstract);
+			case "openviking.recallContextTurns":
+				return String(config.recallContextTurns);
+			case "openviking.captureAssistantTurns":
+				return String(config.captureAssistantTurns);
+			case "openviking.commitEveryNTurns":
+				return String(config.commitEveryNTurns);
+			case "openviking.timeoutMs":
+				return String(config.timeoutMs);
+			case "openviking.captureTimeoutMs":
+				return String(config.captureTimeoutMs);
+			case "openviking.debug":
+				return String(config.debug);
+			default:
+				return undefined;
+		}
 	}
 
 	#getSubmenuCurrentValue(path: SettingPath, value: unknown): string {
@@ -1064,6 +1156,7 @@ export class SettingsSelectorComponent implements Component {
 		} else {
 			settings.set(path, value as never);
 		}
+		this.#maybeRefreshOpenVikingEffectiveConfig(path);
 	}
 
 	/**
@@ -1101,6 +1194,7 @@ export class SettingsSelectorComponent implements Component {
 					settings.set(path, newValue as never);
 					this.callbacks.onChange(path, newValue);
 				}
+				this.#maybeRefreshOpenVikingEffectiveConfig(path);
 				// Submenu/text types already persisted the value inside their own
 				// done callbacks before SettingsList re-dispatches here. Re-run the
 				// definition-to-item mapping so condition-gated settings (e.g. the

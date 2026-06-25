@@ -25,7 +25,7 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 
 	static createIf(session: ToolSession): MemoryRecallTool | null {
 		const backend = session.settings.get("memory.backend");
-		if (backend !== "hindsight" && backend !== "mnemopi") return null;
+		if (backend !== "hindsight" && backend !== "mnemopi" && backend !== "openviking") return null;
 		return new MemoryRecallTool(session);
 	}
 
@@ -58,6 +58,37 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 					};
 				} catch (err) {
 					logger.warn("recall failed", { backend: "mnemopi", bank: state.config.bank, error: String(err) });
+					throw err instanceof Error ? err : new Error(String(err));
+				}
+			}
+
+			if (backend === "openviking") {
+				const state = this.session.getOpenVikingSessionState?.();
+				const primary = state?.aliasOf ?? state;
+				if (!primary) {
+					throw new Error("OpenViking backend is not initialised for this session.");
+				}
+				try {
+					const results = await primary.search(params.query, primary.config.recallLimit);
+					if (results.length === 0) {
+						return {
+							content: [{ type: "text", text: "No relevant memories found." }],
+							details: {},
+							useless: true,
+						};
+					}
+					const formatted = await primary.formatItems(results, true);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Found ${results.length} relevant ${results.length === 1 ? "memory" : "memories"} (as of ${formatCurrentTime()} UTC):\n\n${formatted ?? ""}`,
+							},
+						],
+						details: {},
+					};
+				} catch (err) {
+					logger.warn("recall failed", { backend: "openviking", error: String(err) });
 					throw err instanceof Error ? err : new Error(String(err));
 				}
 			}

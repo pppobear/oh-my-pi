@@ -1146,6 +1146,10 @@
 - Fixed MCP OAuth authorization failing with `Authorization failed: An unexpected error occurred` against authorization servers (Plane is the live example) that reject redundant fallback `resource` indicators. OMP now drops same-origin resources only when it synthesized them from the server URL fallback (e.g. `https://mcp.plane.so/http/mcp`). Provider-advertised resources from OAuth/protected-resource discovery or an embedded authorization-URL `resource` query parameter are preserved even when they are same-origin or origin-only, so gateway-hosted MCP services can still request the audience they advertised. The refresh-token path uses the same policy, filtered against the authorization-server origin persisted on the credential as `authorizationUrl`, with `tokenUrl`'s origin as the legacy fallback when that field is absent. ([#3502](https://github.com/can1357/oh-my-pi/issues/3502))
 
 ## [16.1.20] - 2026-06-25
+### Added
+
+- Added `memory.backend: openviking` for OpenViking-backed recall/retain, first-turn prompt injection, session capture, `/memory` status/search/save, and subagent memory aliasing.
+- Added `viking://` internal URL reads so OpenViking recall results can be expanded through the read tool.
 
 ### Fixed
 

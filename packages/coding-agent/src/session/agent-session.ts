@@ -254,6 +254,7 @@ import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
 import { computeNonMessageBreakdown, computeNonMessageTokens } from "../modes/utils/context-usage";
 import { containsWorkflow, renderWorkflowNotice } from "../modes/workflow";
 import { resolveApprovedPlan } from "../plan-mode/approved-plan";
+import { getOpenVikingSessionState, type OpenVikingSessionState, setOpenVikingSessionState } from "../openviking/state";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -3531,6 +3532,10 @@ export class AgentSession {
 		return getMnemopiSessionState(this);
 	}
 
+	getOpenVikingSessionState(): OpenVikingSessionState | undefined {
+		return getOpenVikingSessionState(this);
+	}
+
 	/** TTSR manager for time-traveling stream rules */
 	get ttsrManager(): TtsrManager | undefined {
 		return this.#ttsrManager;
@@ -6143,6 +6148,13 @@ export class AgentSession {
 		this.getMnemopiSessionState()?.setSessionId(sid);
 	}
 
+	#rekeyOpenVikingMemoryForCurrentSessionId(): void {
+		if (this.settings.get("memory.backend") !== "openviking") return;
+		const sid = this.agent.sessionId;
+		if (!sid) return;
+		this.getOpenVikingSessionState()?.setSessionId(sid);
+	}
+
 	/** New session file: reset auto-recall / retain-threshold counters for the new transcript. */
 	#resetHindsightConversationTrackingIfHindsight(): boolean {
 		if (this.settings.get("memory.backend") !== "hindsight") return false;
@@ -6160,16 +6172,25 @@ export class AgentSession {
 		return true;
 	}
 
+	#resetOpenVikingConversationTrackingIfOpenViking(): boolean {
+		if (this.settings.get("memory.backend") !== "openviking") return false;
+		const state = this.getOpenVikingSessionState();
+		if (!state || state.aliasOf) return false;
+		state.resetConversationTracking();
+		return true;
+	}
+
 	async #resetMemoryContextForNewTranscript(): Promise<void> {
 		const hadPromotedMemoryPrompt = this.#baseSystemPromptBeforeMemoryPromotion !== undefined;
 		const resetHindsight = this.#resetHindsightConversationTrackingIfHindsight();
 		const resetMnemopi = this.#resetMnemopiConversationTrackingIfMnemopi();
+		const resetOpenViking = this.#resetOpenVikingConversationTrackingIfOpenViking();
 		if (hadPromotedMemoryPrompt) {
 			this.#baseSystemPrompt = this.#baseSystemPromptBeforeMemoryPromotion!;
 			this.agent.setSystemPrompt(this.#baseSystemPrompt);
 			this.#baseSystemPromptBeforeMemoryPromotion = undefined;
 		}
-		if (resetHindsight || resetMnemopi || hadPromotedMemoryPrompt) {
+		if (resetHindsight || resetMnemopi || resetOpenViking || hadPromotedMemoryPrompt) {
 			await this.refreshBaseSystemPrompt();
 		}
 	}
@@ -6337,6 +6358,8 @@ export class AgentSession {
 		hindsightState?.dispose();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
 		await mnemopiState?.dispose({ timeoutMs: options.mnemopiConsolidateTimeoutMs });
+		const openVikingState = setOpenVikingSessionState(this, undefined);
+		openVikingState?.dispose();
 		// Tear down the embeddings subprocess AFTER mnemopi state.dispose:
 		// consolidate-on-dispose may still call `embed()` to store the final
 		// memories, and that round-trips through the worker we are about to
@@ -6379,6 +6402,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.#rekeyOpenVikingMemoryForCurrentSessionId();
 		this.agent.appendOnlyContext?.invalidateForModelChange();
 		return {
 			previousSessionId,
@@ -9071,6 +9095,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.#rekeyOpenVikingMemoryForCurrentSessionId();
 		await this.#resetMemoryContextForNewTranscript();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -9162,6 +9187,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.#rekeyOpenVikingMemoryForCurrentSessionId();
 		await this.#resetMemoryContextForNewTranscript();
 
 		// Emit session_switch event with reason "fork" to hooks
@@ -10531,6 +10557,7 @@ export class AgentSession {
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
+			this.#rekeyOpenVikingMemoryForCurrentSessionId();
 			await this.#resetMemoryContextForNewTranscript();
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -15380,6 +15407,7 @@ export class AgentSession {
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
+			this.#rekeyOpenVikingMemoryForCurrentSessionId();
 
 			let sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
@@ -15512,6 +15540,7 @@ export class AgentSession {
 			this.#syncAgentSessionId(previousSessionState.sessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
+			this.#rekeyOpenVikingMemoryForCurrentSessionId();
 			this.agent.setTools(previousTools);
 			this.#baseSystemPrompt = previousBaseSystemPrompt;
 			this.#baseSystemPromptBeforeMemoryPromotion = previousBaseSystemPromptBeforeMemoryPromotion;
@@ -15597,6 +15626,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.#rekeyOpenVikingMemoryForCurrentSessionId();
 		await this.#resetMemoryContextForNewTranscript();
 
 		// Reload messages from entries (works for both file and in-memory mode)
@@ -15689,6 +15719,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.#rekeyOpenVikingMemoryForCurrentSessionId();
 		await this.#resetMemoryContextForNewTranscript();
 
 		const sessionContext = this.buildDisplaySessionContext();

@@ -71,6 +71,31 @@ describe("SettingsList", () => {
 		expect(output).not.toContain("[changed-label]Default");
 	});
 
+	it("renders displayValue without changing cycled currentValue", () => {
+		const changes: Array<[string, string]> = [];
+		const list = new SettingsList(
+			[
+				{
+					id: "endpoint",
+					label: "Endpoint",
+					currentValue: "",
+					displayValue: "https://effective.example",
+					values: ["", "custom"],
+				},
+			],
+			5,
+			testTheme,
+			(id, value) => {
+				changes.push([id, value]);
+			},
+			() => {},
+		);
+
+		expect(list.render(80).join("\n")).toContain("https://effective.example");
+		list.handleInput("\n");
+		expect(changes).toEqual([["endpoint", "custom"]]);
+	});
+
 	it("renders long settings tabs through a scrollbar viewport", () => {
 		const list = new SettingsList(
 			Array.from({ length: 6 }, (_, i) => ({

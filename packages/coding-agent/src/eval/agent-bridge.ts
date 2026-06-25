@@ -430,6 +430,7 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 		parentArtifactManager,
 		parentHindsightSessionState: options.session.getHindsightSessionState?.(),
 		parentMnemopiSessionState: options.session.getMnemopiSessionState?.(),
+		parentOpenVikingSessionState: options.session.getOpenVikingSessionState?.(),
 		parentTelemetry: options.session.getTelemetry?.(),
 		parentAgentId: options.session.getAgentId?.() ?? MAIN_AGENT_ID,
 		// Live source of truth for `tier.subagent: inherit` (null = explicit none).

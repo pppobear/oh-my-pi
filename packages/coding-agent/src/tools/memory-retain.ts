@@ -28,7 +28,7 @@ export class MemoryRetainTool implements AgentTool<typeof memoryRetainSchema> {
 
 	static createIf(session: ToolSession): MemoryRetainTool | null {
 		const backend = session.settings.get("memory.backend");
-		if (backend !== "hindsight" && backend !== "mnemopi") return null;
+		if (backend !== "hindsight" && backend !== "mnemopi" && backend !== "openviking") return null;
 		return new MemoryRetainTool(session);
 	}
 
@@ -63,6 +63,23 @@ export class MemoryRetainTool implements AgentTool<typeof memoryRetainSchema> {
 			return {
 				content: [{ type: "text", text: `${count} ${noun} stored.` }],
 				details: { count },
+			};
+		}
+
+		if (backend === "openviking") {
+			const state = this.session.getOpenVikingSessionState?.();
+			const primary = state?.aliasOf ?? state;
+			if (!primary) {
+				throw new Error("OpenViking backend is not initialised for this session.");
+			}
+			let stored = 0;
+			for (const item of params.items) {
+				if (await primary.save(item.content, item.context)) stored += 1;
+			}
+			const noun = stored === 1 ? "memory" : "memories";
+			return {
+				content: [{ type: "text", text: `${stored} ${noun} stored.` }],
+				details: { count: stored },
 			};
 		}
 

@@ -26,7 +26,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 
 	static createIf(session: ToolSession): MemoryReflectTool | null {
 		const backend = session.settings.get("memory.backend");
-		if (backend !== "hindsight" && backend !== "mnemopi") return null;
+		if (backend !== "hindsight" && backend !== "mnemopi" && backend !== "openviking") return null;
 		return new MemoryReflectTool(session);
 	}
 
@@ -57,6 +57,34 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					};
 				} catch (err) {
 					logger.warn("reflect failed", { backend: "mnemopi", bank: state.config.bank, error: String(err) });
+					throw err instanceof Error ? err : new Error(String(err));
+				}
+			}
+
+			if (backend === "openviking") {
+				const state = this.session.getOpenVikingSessionState?.();
+				const primary = state?.aliasOf ?? state;
+				if (!primary) {
+					throw new Error("OpenViking backend is not initialised for this session.");
+				}
+				try {
+					const query = params.context?.trim()
+						? `${params.query.trim()}\n\nAdditional context:\n${params.context.trim()}`
+						: params.query;
+					const results = await primary.search(query, primary.config.recallLimit);
+					if (results.length === 0) {
+						return {
+							content: [{ type: "text", text: "No relevant information found to reflect on." }],
+							details: {},
+						};
+					}
+					const summary = await primary.formatItems(results, true);
+					return {
+						content: [{ type: "text", text: `Based on recalled OpenViking memories:\n\n${summary ?? ""}` }],
+						details: {},
+					};
+				} catch (err) {
+					logger.warn("reflect failed", { backend: "openviking", error: String(err) });
 					throw err instanceof Error ? err : new Error(String(err));
 				}
 			}

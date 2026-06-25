@@ -131,7 +131,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Git",
 	],
 	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
-	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight"],
+	memory: ["General", "Auto-Learn", "Mnemopi", "OpenViking", "Hindsight"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Runtimes"],
 	tools: [
@@ -2419,18 +2419,18 @@ export const SETTINGS_SCHEMA = {
 	"memories.summaryInjectionTokenLimit": { type: "number", default: 5000 },
 
 	// Memory backend selector — picks between local memories pipeline,
-	// Mnemopi local SQLite, Hindsight remote memory, or off. Legacy
-	// `memories.enabled` keeps gating the local backend; see config/settings.ts
-	// migration for details.
+	// Mnemopi local SQLite, Hindsight remote memory, OpenViking context database,
+	// or off. Legacy `memories.enabled` keeps gating the local backend; see
+	// config/settings.ts migration for details.
 	"memory.backend": {
 		type: "enum",
-		values: ["off", "local", "hindsight", "mnemopi"] as const,
+		values: ["off", "local", "hindsight", "mnemopi", "openviking"] as const,
 		default: "off",
 		ui: {
 			tab: "memory",
 			group: "General",
 			label: "Memory Backend",
-			description: "Off, local summary pipeline, Mnemopi SQLite, or Hindsight remote memory",
+			description: "Off, local summary pipeline, Mnemopi SQLite, Hindsight, or OpenViking remote memory",
 			options: [
 				{ value: "off", label: "Off", description: "No memory subsystem runs" },
 				{ value: "local", label: "Local", description: "Local rollout summarisation pipeline (memory_summary.md)" },
@@ -2440,6 +2440,7 @@ export const SETTINGS_SCHEMA = {
 					label: "Mnemopi",
 					description: "Local SQLite recall/retain backend with optional embeddings",
 				},
+				{ value: "openviking", label: "OpenViking", description: "OpenViking context database memory service" },
 			],
 		},
 	},
@@ -2713,6 +2714,272 @@ export const SETTINGS_SCHEMA = {
 	"mnemopi.recallMaxQueryChars": { type: "number", default: 4000 },
 	"mnemopi.injectionTokenLimit": { type: "number", default: 5000 },
 	"mnemopi.debug": { type: "boolean", default: false },
+
+	// OpenViking context database backend.
+	"openviking.apiUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking API URL",
+			description: "OpenViking server URL. Defaults to http://127.0.0.1:1933 or ~/.openviking config.",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.apiKey": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking API Key",
+			description: "Optional OpenViking API key. Leave empty to use OPENVIKING_API_KEY or ~/.openviking config.",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.account": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Account",
+			description: "Optional OpenViking account id. Leave empty to use OPENVIKING_ACCOUNT or ~/.openviking config.",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.user": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking User",
+			description: "Optional OpenViking user id. Leave empty to use OPENVIKING_USER or ~/.openviking config.",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.peerId": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Peer ID",
+			description: "Optional peer id sent with retained messages. Leave empty for server defaults.",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.autoRecall": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Auto Recall",
+			description: "Search OpenViking before each agent turn and inject relevant context",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.autoRetain": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Auto Retain",
+			description: "Capture completed conversation turns into the persistent OpenViking session",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.recallLimit": {
+		type: "number",
+		default: 6,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Recall Limit",
+			description: "Maximum OpenViking memory items recalled per search",
+			condition: "openvikingActive",
+			options: [
+				{ value: "3", label: "3", description: "Small context budget" },
+				{ value: "6", label: "6", description: "Default recall breadth" },
+				{ value: "10", label: "10", description: "Broader recall" },
+				{ value: "20", label: "20", description: "Wide recall for large tasks" },
+			],
+		},
+	},
+	"openviking.scoreThreshold": {
+		type: "number",
+		default: 0.35,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Score Threshold",
+			description: "Minimum recall score accepted from OpenViking search",
+			condition: "openvikingActive",
+			options: [
+				{ value: "0", label: "0", description: "Accept every result" },
+				{ value: "0.1", label: "0.1", description: "Lenient filtering" },
+				{ value: "0.35", label: "0.35", description: "Default filtering" },
+				{ value: "0.5", label: "0.5", description: "Stricter filtering" },
+				{ value: "0.8", label: "0.8", description: "Only high-confidence matches" },
+			],
+		},
+	},
+	"openviking.minQueryLength": {
+		type: "number",
+		default: 3,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Min Query Length",
+			description: "Skip automatic recall for shorter queries",
+			condition: "openvikingActive",
+			options: [
+				{ value: "1", label: "1", description: "Recall for nearly every prompt" },
+				{ value: "3", label: "3", description: "Default minimum" },
+				{ value: "8", label: "8", description: "Skip short prompts" },
+				{ value: "20", label: "20", description: "Only recall for substantive prompts" },
+			],
+		},
+	},
+	"openviking.recallMaxContentChars": {
+		type: "number",
+		default: 500,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Recall Item Chars",
+			description: "Maximum characters kept from each recalled item",
+			condition: "openvikingActive",
+			options: [
+				{ value: "500", label: "500", description: "Default compact items" },
+				{ value: "1000", label: "1000", description: "More detail per item" },
+				{ value: "2000", label: "2000", description: "Long recalled passages" },
+				{ value: "5000", label: "5000", description: "Very long recalled passages" },
+			],
+		},
+	},
+	"openviking.recallTokenBudget": {
+		type: "number",
+		default: 2000,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Recall Token Budget",
+			description: "Token budget for injected OpenViking memory context",
+			condition: "openvikingActive",
+			options: [
+				{ value: "1000", label: "1k", description: "Compact memory injection" },
+				{ value: "2000", label: "2k", description: "Default budget" },
+				{ value: "5000", label: "5k", description: "Large memory context" },
+				{ value: "10000", label: "10k", description: "Very large memory context" },
+			],
+		},
+	},
+	"openviking.recallPreferAbstract": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Prefer Abstract",
+			description: "Prefer abstract summaries over full recalled content when available",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.recallContextTurns": {
+		type: "number",
+		default: 6,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Recall Context Turns",
+			description: "Recent conversation turns included in automatic recall queries",
+			condition: "openvikingActive",
+			options: [
+				{ value: "1", label: "1", description: "Use only the latest turn" },
+				{ value: "3", label: "3", description: "Small local context" },
+				{ value: "6", label: "6", description: "Default local context" },
+				{ value: "10", label: "10", description: "Broader local context" },
+			],
+		},
+	},
+	"openviking.captureAssistantTurns": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Capture Assistant Turns",
+			description: "Include assistant messages when retaining conversation turns",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.commitEveryNTurns": {
+		type: "number",
+		default: 4,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Commit Interval",
+			description: "Commit captured session turns after this many user turns",
+			condition: "openvikingActive",
+			options: [
+				{ value: "1", label: "Every turn", description: "Commit after each user turn" },
+				{ value: "4", label: "4 turns", description: "Default batching" },
+				{ value: "8", label: "8 turns", description: "Less frequent commits" },
+				{ value: "16", label: "16 turns", description: "Large commit batches" },
+			],
+		},
+	},
+	"openviking.timeoutMs": {
+		type: "number",
+		default: 15000,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Request Timeout",
+			description: "Timeout for OpenViking health, ready, search, and read requests",
+			condition: "openvikingActive",
+			options: [
+				{ value: "5000", label: "5s", description: "Fast local server" },
+				{ value: "15000", label: "15s", description: "Default timeout" },
+				{ value: "30000", label: "30s", description: "Slow network" },
+				{ value: "60000", label: "60s", description: "Very slow network" },
+			],
+		},
+	},
+	"openviking.captureTimeoutMs": {
+		type: "number",
+		default: 30000,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Capture Timeout",
+			description: "Timeout for OpenViking message capture and commit requests",
+			condition: "openvikingActive",
+			options: [
+				{ value: "10000", label: "10s", description: "Fast local server" },
+				{ value: "30000", label: "30s", description: "Default capture timeout" },
+				{ value: "60000", label: "60s", description: "Slow capture path" },
+				{ value: "120000", label: "120s", description: "Very slow capture path" },
+			],
+		},
+	},
+	"openviking.debug": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Debug Logging",
+			description: "Enable additional OpenViking backend debug logging",
+			condition: "openvikingActive",
+		},
+	},
 
 	// Hindsight (https://hindsight.vectorize.io)
 	"hindsight.apiUrl": {

@@ -11,9 +11,10 @@ import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { MnemopiSessionState } from "../mnemopi/state";
+import type { OpenVikingSessionState } from "../openviking/state";
 import type { AgentSession } from "../session/agent-session";
 
-export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi";
+export type MemoryBackendId = "off" | "local" | "hindsight" | "mnemopi" | "openviking";
 
 export interface MemoryBackendStatus {
 	backend: MemoryBackendId;
@@ -90,6 +91,7 @@ export interface MemoryBackendStartOptions {
 	taskDepth: number;
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
+	parentOpenVikingSessionState?: OpenVikingSessionState;
 }
 
 export interface MemoryBackend {

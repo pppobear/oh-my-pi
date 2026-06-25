@@ -106,6 +106,13 @@ const CONDITIONS: Record<string, () => boolean> = {
 			return false;
 		}
 	},
+	openvikingActive: () => {
+		try {
+			return Settings.instance.get("memory.backend") === "openviking";
+		} catch {
+			return false;
+		}
+	},
 	autolearnActive: () => {
 		try {
 			return Settings.instance.get("autolearn.enabled") === true;

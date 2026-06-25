@@ -126,6 +126,42 @@ describe("settings layout", () => {
 		expect(description).toContain("selector");
 	});
 
+	it("exposes OpenViking connection and tuning settings when OpenViking is active", () => {
+		const openVikingPaths: SettingPath[] = [
+			"openviking.apiUrl",
+			"openviking.apiKey",
+			"openviking.account",
+			"openviking.user",
+			"openviking.peerId",
+			"openviking.autoRecall",
+			"openviking.autoRetain",
+			"openviking.recallLimit",
+			"openviking.scoreThreshold",
+			"openviking.minQueryLength",
+			"openviking.recallMaxContentChars",
+			"openviking.recallTokenBudget",
+			"openviking.recallPreferAbstract",
+			"openviking.recallContextTurns",
+			"openviking.captureAssistantTurns",
+			"openviking.commitEveryNTurns",
+			"openviking.timeoutMs",
+			"openviking.captureTimeoutMs",
+			"openviking.debug",
+		];
+		const defs = getSettingsForTab("memory").filter(def => openVikingPaths.includes(def.path));
+
+		expect(defs.map(def => def.path)).toEqual(openVikingPaths);
+		for (const def of defs) {
+			expect(def.condition?.()).toBe(false);
+		}
+
+		Settings.instance.set("memory.backend", "openviking");
+
+		for (const def of defs) {
+			expect(def.condition?.()).toBe(true);
+		}
+	});
+
 	it("exposes ask.enabled as a boolean under Available Tools", () => {
 		const def = getSettingsForTab("tools").find(def => def.path === "ask.enabled");
 

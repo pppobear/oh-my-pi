@@ -12,6 +12,10 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("artifact://3:1-100")).toEqual({ path: "artifact://3", sel: "1-100" });
 		expect(splitInternalUrlSel("artifact://3:50+150")).toEqual({ path: "artifact://3", sel: "50+150" });
 		expect(splitInternalUrlSel("artifact://3:50-")).toEqual({ path: "artifact://3", sel: "50-" });
+		expect(splitInternalUrlSel("viking://user/enoch/memories/entities/基础设施/家庭网络与设备.md:1-40")).toEqual({
+			path: "viking://user/enoch/memories/entities/基础设施/家庭网络与设备.md",
+			sel: "1-40",
+		});
 	});
 
 	it("peels a `raw` selector", () => {

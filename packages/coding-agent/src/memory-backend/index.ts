@@ -11,6 +11,7 @@ export type {
 	MnemopiSessionState,
 	MnemopiSessionStateOptions,
 } from "../mnemopi/state";
+export * from "../openviking";
 export * from "./local-backend";
 export * from "./off-backend";
 export * from "./resolve";
