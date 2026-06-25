@@ -1385,6 +1385,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"paste.autoAttachFilePaths": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Auto-Attach Pasted File Paths",
+			description:
+				"When bracketed paste contains an explicit file path, attach image paths or copy non-image files to local:// instead of pasting the original path.",
+		},
+	},
+
 	"startup.quiet": {
 		type: "boolean",
 		default: false,

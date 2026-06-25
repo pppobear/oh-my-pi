@@ -12,7 +12,12 @@ import * as path from "node:path";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 
-function createContext(options?: { threshold?: number; choice?: string; artifactsDir?: string }) {
+function createContext(options?: {
+	threshold?: number;
+	choice?: string;
+	artifactsDir?: string;
+	autoAttachFilePaths?: boolean;
+}) {
 	const insertPaste = vi.fn();
 	const insertText = vi.fn();
 	const pasteText = vi.fn();
@@ -20,10 +25,15 @@ function createContext(options?: { threshold?: number; choice?: string; artifact
 	const showStatus = vi.fn();
 	const showError = vi.fn();
 	const showHookSelector = vi.fn(async (_title: string, _options: unknown, _dialog?: unknown) => options?.choice);
+	const getSetting = vi.fn((key: string) => {
+		if (key === "paste.largeMenuThreshold") return options?.threshold ?? 100;
+		if (key === "paste.autoAttachFilePaths") return options?.autoAttachFilePaths ?? false;
+		return undefined;
+	});
 	const ctx = {
 		editor: { insertPaste, insertText, pasteText } as unknown as InteractiveModeContext["editor"],
 		ui: { requestRender } as unknown as InteractiveModeContext["ui"],
-		settings: { get: () => options?.threshold ?? 100 } as unknown as InteractiveModeContext["settings"],
+		settings: { get: getSetting } as unknown as InteractiveModeContext["settings"],
 		sessionManager: {
 			getCwd: () => process.cwd(),
 			getArtifactsDir: () => options?.artifactsDir ?? null,
@@ -36,7 +46,7 @@ function createContext(options?: { threshold?: number; choice?: string; artifact
 	const controller = new InputController(ctx);
 	return {
 		controller,
-		spies: { insertPaste, insertText, pasteText, requestRender, showStatus, showError, showHookSelector },
+		spies: { insertPaste, insertText, pasteText, requestRender, showStatus, showError, showHookSelector, getSetting },
 	};
 }
 
@@ -150,12 +160,31 @@ describe("InputController.presentLargePasteMenu file attachment", () => {
 		expect(await Bun.file(path.join(dir, "local", "attachment-2")).text()).toBe("fresh");
 	});
 
-	it("attaches an existing pasted file as a local:// reference with its extension", async () => {
+	it("pastes an existing file path inline by default", async () => {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-file-paste-test-"));
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-file-paste-source-"));
 		const sourcePath = path.join(sourceDir, "report.csv");
 		await Bun.write(sourcePath, "name,value\nalpha,1\n");
 		const { controller, spies } = createContext({ artifactsDir: dir });
+
+		try {
+			await controller.handleFilePathPaste(sourcePath);
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+		}
+
+		expect(spies.pasteText).toHaveBeenCalledWith(sourcePath);
+		expect(spies.insertText).not.toHaveBeenCalled();
+		expect(spies.requestRender).toHaveBeenCalled();
+		expect(await Bun.file(path.join(dir, "local", "attachment-1.csv")).exists()).toBe(false);
+	});
+
+	it("attaches an existing pasted file as a local:// reference when enabled", async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-file-paste-test-"));
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-file-paste-source-"));
+		const sourcePath = path.join(sourceDir, "report.csv");
+		await Bun.write(sourcePath, "name,value\nalpha,1\n");
+		const { controller, spies } = createContext({ artifactsDir: dir, autoAttachFilePaths: true });
 
 		try {
 			await controller.handleFilePathPaste(sourcePath);
@@ -173,7 +202,7 @@ describe("InputController.presentLargePasteMenu file attachment", () => {
 	it("falls back to inline text when the pasted file path does not exist", async () => {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-file-paste-test-"));
 		const missing = path.join(dir, "missing.txt");
-		const { controller, spies } = createContext({ artifactsDir: dir });
+		const { controller, spies } = createContext({ artifactsDir: dir, autoAttachFilePaths: true });
 
 		await controller.handleFilePathPaste(missing);
 

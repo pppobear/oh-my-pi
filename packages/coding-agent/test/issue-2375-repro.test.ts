@@ -36,7 +36,7 @@ const ONE_PX_PNG = Buffer.from(
 	"base64",
 );
 
-function createContext() {
+function createContext(options?: { autoAttachFilePaths?: boolean }) {
 	const pasteText = vi.fn();
 	const insertText = vi.fn();
 	const requestRender = vi.fn();
@@ -54,6 +54,12 @@ function createContext() {
 			getCwd: () => process.cwd(),
 			putBlob: async () => ({ hash: "h", path: "/tmp/h.png", displayPath: "/tmp/h.png" }),
 		} as unknown as InteractiveModeContext["sessionManager"],
+		settings: {
+			get: (key: string) => {
+				if (key === "paste.autoAttachFilePaths") return options?.autoAttachFilePaths ?? true;
+				return undefined;
+			},
+		} as unknown as InteractiveModeContext["settings"],
 		showStatus,
 	} as unknown as InteractiveModeContext;
 	return { ctx, spies: { pasteText, insertText, requestRender, showStatus } };
@@ -81,6 +87,19 @@ describe("InputController.handleImagePathPaste (issue #2375)", () => {
 		else process.env.SSH_CLIENT = originalSshClient;
 		resetSettingsForTest();
 		vi.restoreAllMocks();
+	});
+
+	it("pastes image paths inline when auto-attach is disabled", async () => {
+		const { ctx, spies } = createContext({ autoAttachFilePaths: false });
+		const controller = new InputController(ctx, EMPTY_CLIPBOARD);
+		const figure = "/tmp/figure.png";
+
+		await controller.handleImagePathPaste(figure);
+
+		expect(spies.pasteText).toHaveBeenCalledWith(figure);
+		expect(spies.requestRender).toHaveBeenCalled();
+		expect(spies.showStatus).not.toHaveBeenCalled();
+		expect(ctx.editor.pendingImages.length).toBe(0);
 	});
 
 	it("over SSH: never pastes the unreachable path as text and surfaces an SSH-aware status", async () => {
