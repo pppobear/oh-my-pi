@@ -130,6 +130,30 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(1);
 	});
 
+	it("does not let a stale explicit refresh overwrite a newer MCP tool prompt", async () => {
+		const staleRefreshStarted = Promise.withResolvers<void>();
+		const releaseStaleRefresh = Promise.withResolvers<void>();
+		let blockInitialTools = true;
+		const { session } = newSession(async toolNames => {
+			if (blockInitialTools && toolNames.includes("mcp__nucleus_search")) {
+				blockInitialTools = false;
+				staleRefreshStarted.resolve();
+				await releaseStaleRefresh.promise;
+			}
+			return `tools:${toolNames.join(",")}`;
+		});
+
+		const staleRefresh = session.refreshBaseSystemPrompt();
+		await staleRefreshStarted.promise;
+		const replacement = createMcpCustomTool("mcp__demo_tool", "demo", "tool", "Demo tool");
+		await session.refreshMCPTools([replacement], { activateAll: true });
+		releaseStaleRefresh.resolve();
+		await staleRefresh;
+
+		expect(session.getActiveToolNames()).toEqual(["read", "mcp__demo_tool"]);
+		expect(session.systemPrompt).toEqual(["tools:read,mcp__demo_tool"]);
+	});
+
 	it("rebuilds when an MCP tool's description changes", async () => {
 		let rebuildCount = 0;
 		const { session } = newSession(async toolNames => {

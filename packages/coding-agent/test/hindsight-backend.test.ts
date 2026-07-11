@@ -586,6 +586,45 @@ describe("hindsightBackend live bank routing", () => {
 		expect(next).not.toBe(initial);
 	});
 
+	it("does not let an in-flight scope rebuild reinstall state after backend stop", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		settings.set("hindsight.bankId", "before-stop");
+		const session = makeFakeSession({ sessionId: "s-stop-rebuild-race", settings });
+
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		const initial = session.getHindsightSessionState();
+		expect(initial).toBeDefined();
+		expect(session.listenerCount()).toBe(1);
+		const flushGate = Promise.withResolvers<void>();
+		const flushSpy = vi.spyOn(initial!, "flushRetainQueue").mockImplementation(async () => {
+			await flushGate.promise;
+		});
+
+		settings.set("hindsight.bankId", "during-stop");
+		await Bun.sleep(0);
+		expect(flushSpy).toHaveBeenCalledTimes(1);
+
+		const stopping = hindsightBackend.stop!({ session: session as never });
+		await Bun.sleep(0);
+		expect(flushSpy).toHaveBeenCalledTimes(2);
+		flushGate.resolve();
+		await stopping;
+		await Bun.sleep(0);
+
+		expect(session.getHindsightSessionState()).toBeUndefined();
+		expect(session.listenerCount()).toBe(0);
+	});
+
 	// Same regression, exercising the `hindsight.scoping` axis: switching
 	// scope mode also reshapes the bank id / tag filters and must rebuild.
 	it("rebuilds the primary state when hindsight.scoping changes mid-session", async () => {

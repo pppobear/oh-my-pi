@@ -88,15 +88,34 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 
 		try {
-			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-			const state = new MnemopiSessionState({ sessionId, config, session });
-			const previous = setMnemopiSessionState(session, state);
-			await previous?.dispose();
-			state.attachSessionListeners();
+			while (!session.isDisposed) {
+				const liveSessionId = session.sessionId;
+				if (!liveSessionId) return;
+				const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, liveSessionId);
+				// Session transitions rekey an installed state synchronously, but they
+				// cannot rekey a candidate still waiting on credential/provider setup.
+				// Retry against the live id instead of publishing a stale candidate.
+				if (session.sessionId !== liveSessionId) continue;
+
+				const state = new MnemopiSessionState({ sessionId: liveSessionId, config, session });
+				const previous = setMnemopiSessionState(session, state);
+				await previous?.dispose();
+				if (getMnemopiSessionState(session) !== state) {
+					await state.dispose();
+					return;
+				}
+				state.attachSessionListeners();
+				return;
+			}
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}
+	},
+
+	async stop({ session }): Promise<void> {
+		const state = setMnemopiSessionState(session, undefined);
+		await state?.dispose();
 	},
 
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {

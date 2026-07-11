@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { SettingsList, type SettingsListTheme } from "@oh-my-pi/pi-tui/components/settings-list";
+import {
+	getSettingItemFilterText,
+	SettingsList,
+	type SettingsListTheme,
+} from "@oh-my-pi/pi-tui/components/settings-list";
 import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@oh-my-pi/pi-tui/keybindings";
+import { DEFAULT_TAB_WIDTH } from "@oh-my-pi/pi-utils";
 
 const testTheme: SettingsListTheme = {
 	label: (text: string) => text,
@@ -94,6 +99,70 @@ describe("SettingsList", () => {
 		expect(list.render(80).join("\n")).toContain("https://effective.example");
 		list.handleInput("\n");
 		expect(changes).toEqual([["endpoint", "custom"]]);
+	});
+
+	it("sanitizes displayed values into one terminal-safe row", () => {
+		const list = new SettingsList(
+			[
+				{
+					id: "endpoint",
+					label: "Endpoint",
+					currentValue: "raw\tvalue\r\nwith\x08controls",
+					displayValue: "https://effective.example\tpath\r\nnext\x1b[31mred\x1b[0m\x07",
+				},
+			],
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+
+		const firstRow = list.render(80)[0];
+		expect(firstRow).toContain(`https://effective.example${" ".repeat(DEFAULT_TAB_WIDTH)}path nextred`);
+		expect(firstRow).not.toMatch(/[\r\n\t\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+	});
+
+	it("preserves meaningful ordinary spaces in displayed values", () => {
+		const spacingTheme: SettingsListTheme = {
+			...testTheme,
+			value: text => `[${text}]`,
+		};
+		const list = new SettingsList(
+			[{ id: "spaced", label: "Spaced", currentValue: "  a  b  " }],
+			5,
+			spacingTheme,
+			() => {},
+			() => {},
+		);
+
+		expect(list.render(80)[0]).toContain("[  a  b  ]");
+	});
+
+	it("sanitizes current values and searchable text when displayValue is absent", () => {
+		const item = {
+			id: "browser.path\x1b[2J",
+			label: "Browser Path",
+			description: "Executable\r\npath\x00",
+			currentValue: "/Applications/Browser.app\t--safe\x1b[31m-mode\x1b[0m",
+			values: ["default", "custom\nvalue"],
+		};
+		const list = new SettingsList(
+			[item],
+			5,
+			testTheme,
+			() => {},
+			() => {},
+		);
+
+		const firstRow = list.render(80)[0];
+		expect(firstRow).toContain(`/Applications/Browser.app${" ".repeat(DEFAULT_TAB_WIDTH)}--safe-mode`);
+		expect(firstRow).not.toMatch(/[\r\n\t\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+
+		const filterText = getSettingItemFilterText(item);
+		expect(filterText).toBe(
+			"Browser Path browser.path /Applications/Browser.app --safe-mode Executable path default custom value",
+		);
+		expect(filterText).not.toMatch(/[\r\n\t\x00-\x08\x0b-\x1f\x7f-\x9f]/);
 	});
 
 	it("renders long settings tabs through a scrollbar viewport", () => {

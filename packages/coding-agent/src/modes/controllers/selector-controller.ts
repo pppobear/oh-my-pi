@@ -373,6 +373,15 @@ export class SelectorController {
 	 * This handles side effects and session-specific settings.
 	 */
 	handleSettingChange(id: string, value: unknown): void {
+		if (id === "memory.backend" || id.startsWith("openviking.")) {
+			void this.ctx.session.reconcileMemoryBackend().catch(error => {
+				this.ctx.showError(
+					`Failed to apply memory backend settings: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			});
+			return;
+		}
+
 		// Discovery provider toggles
 		if (id.startsWith("discovery.")) {
 			const providerId = id.replace("discovery.", "");

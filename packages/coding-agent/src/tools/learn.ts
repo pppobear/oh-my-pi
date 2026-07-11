@@ -93,8 +93,26 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 			if (!primary) {
 				throw new Error("OpenViking backend is not initialised for this session.");
 			}
-			if (!(await primary.save(params.memory, params.context))) {
-				throw new Error("OpenViking did not acknowledge the lesson write.");
+			const outcome = await primary.save(params.memory, params.context);
+			if (outcome.status === "failed") {
+				throw new Error(outcome.error);
+			}
+			if (outcome.status === "reconciling") {
+				memoryMessage = "Lesson write acknowledgement unavailable; automatic reconciliation pending";
+			}
+			if (outcome.status === "queued") {
+				memoryMessage =
+					outcome.reason === "timeout"
+						? "Lesson queued for extraction"
+						: outcome.reason === "aborted"
+							? "Lesson archived; extraction status check interrupted"
+							: "Lesson archived; extraction status unavailable";
+			}
+			if (outcome.status === "completed") {
+				memoryMessage =
+					outcome.extracted === 0
+						? "Lesson processed; no durable memory extracted"
+						: "Lesson extraction completed; durable-memory count unavailable";
 			}
 		} else {
 			const state = this.session.getHindsightSessionState?.();

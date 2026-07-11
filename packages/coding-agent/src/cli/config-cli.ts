@@ -5,13 +5,14 @@
  * Uses the settings schema as the source of truth for available settings.
  */
 
-import { APP_NAME, getAgentDir } from "@oh-my-pi/pi-utils";
+import { APP_NAME, getAgentDir, sanitizeText } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import {
 	getDefault,
 	getEnumValues,
 	getType,
 	getUi,
+	isSecretSetting,
 	type SettingPath,
 	Settings,
 	type SettingValue,
@@ -20,6 +21,7 @@ import {
 } from "../config/settings";
 import { SETTINGS_SCHEMA } from "../config/settings-schema";
 import { theme } from "../modes/theme/theme";
+import { loadOpenVikingConfig } from "../openviking/config";
 import { initXdg } from "./commands/init-xdg";
 
 // =============================================================================
@@ -45,6 +47,7 @@ type CliSettingDef = {
 	type: string;
 	description: string;
 	tab: string;
+	secret: boolean;
 };
 
 const ALL_SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
@@ -59,6 +62,7 @@ function findSettingDef(path: string): CliSettingDef | undefined {
 		type: getType(key),
 		description: ui?.description ?? "",
 		tab: ui?.tab ?? "internal",
+		secret: isSecretSetting(key),
 	};
 }
 
@@ -146,6 +150,42 @@ function formatValue(value: unknown): string {
 		}
 	}
 	return chalk.yellow(String(value));
+}
+
+const SECRET_SETTING_ENVIRONMENT: Partial<Record<SettingPath, readonly string[]>> = {
+	"auth.broker.token": ["OMP_AUTH_BROKER_TOKEN"],
+	"hindsight.apiToken": ["HINDSIGHT_API_TOKEN"],
+	"searxng.token": ["SEARXNG_TOKEN"],
+	"searxng.basicPassword": ["SEARXNG_BASIC_PASSWORD"],
+	"dev.autoqaPush.token": ["PI_AUTO_QA_PUSH_TOKEN"],
+};
+
+async function settingSecretConfigured(def: CliSettingDef, value: unknown): Promise<boolean> {
+	if (def.path === "openviking.apiKey") {
+		return isSecretConfigured((await loadOpenVikingConfig(settings)).apiKey);
+	}
+	for (const name of SECRET_SETTING_ENVIRONMENT[def.path] ?? []) {
+		if (isSecretConfigured(Bun.env[name])) return true;
+	}
+	return isSecretConfigured(value);
+}
+
+async function displaySettingValue(def: CliSettingDef, value: unknown): Promise<unknown> {
+	if (!def.secret) return value;
+	return (await settingSecretConfigured(def, value)) ? "(configured)" : undefined;
+}
+
+function isSecretConfigured(value: unknown): boolean {
+	if (typeof value === "string") return sanitizeText(value).trim().length > 0;
+	return value !== undefined && value !== null;
+}
+
+async function jsonSettingValue(
+	def: CliSettingDef,
+	value: unknown,
+): Promise<{ value: unknown; configured?: boolean; redacted?: true }> {
+	if (!def.secret) return { value };
+	return { value: null, configured: await settingSecretConfigured(def, value), redacted: true };
 }
 
 function getTypeDisplay(def: CliSettingDef): string {
@@ -244,7 +284,7 @@ export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
 			await handleList(cmd.flags);
 			break;
 		case "get":
-			handleGet(cmd.key, cmd.flags);
+			await handleGet(cmd.key, cmd.flags);
 			break;
 		case "set":
 			await handleSet(cmd.key, cmd.value, cmd.flags);
@@ -277,10 +317,13 @@ async function handleList(flags: { json?: boolean }): Promise<void> {
 	const defs = ALL_SETTING_PATHS.map(path => findSettingDef(path)).filter((def): def is CliSettingDef => !!def);
 
 	if (flags.json) {
-		const result: Record<string, { value: unknown; type: string; description: string }> = {};
+		const result: Record<
+			string,
+			{ value: unknown; type: string; description: string; configured?: boolean; redacted?: true }
+		> = {};
 		for (const def of defs) {
 			result[def.path] = {
-				value: settings.get(def.path),
+				...(await jsonSettingValue(def, settings.get(def.path))),
 				type: def.type,
 				description: def.description,
 			};
@@ -308,7 +351,7 @@ async function handleList(flags: { json?: boolean }): Promise<void> {
 	for (const group of sortedGroups) {
 		console.log(chalk.bold.blue(`[${group}]`));
 		for (const def of groups[group]) {
-			const value = settings.get(def.path);
+			const value = await displaySettingValue(def, settings.get(def.path));
 			const valueStr = formatValue(value);
 			const typeStr = getTypeDisplay(def);
 			console.log(`  ${chalk.white(def.path)} = ${valueStr} ${chalk.dim(typeStr)}`);
@@ -317,7 +360,7 @@ async function handleList(flags: { json?: boolean }): Promise<void> {
 	}
 }
 
-function handleGet(key: string | undefined, flags: { json?: boolean }): void {
+async function handleGet(key: string | undefined, flags: { json?: boolean }): Promise<void> {
 	if (!key) {
 		console.error(chalk.red(`Usage: ${APP_NAME} config get <key>`));
 		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
@@ -331,14 +374,25 @@ function handleGet(key: string | undefined, flags: { json?: boolean }): void {
 		process.exit(1);
 	}
 
-	const value = settings.get(def.path);
+	const rawValue = settings.get(def.path);
 
 	if (flags.json) {
-		console.log(JSON.stringify({ key: def.path, value, type: def.type, description: def.description }, null, 2));
+		console.log(
+			JSON.stringify(
+				{
+					key: def.path,
+					...(await jsonSettingValue(def, rawValue)),
+					type: def.type,
+					description: def.description,
+				},
+				null,
+				2,
+			),
+		);
 		return;
 	}
 
-	console.log(formatValue(value));
+	console.log(formatValue(await displaySettingValue(def, rawValue)));
 }
 
 async function handleSet(key: string | undefined, value: string | undefined, flags: { json?: boolean }): Promise<void> {
@@ -362,12 +416,16 @@ async function handleSet(key: string | undefined, value: string | undefined, fla
 		process.exit(1);
 	}
 
-	const newValue = settings.get(def.path);
+	const rawNewValue = settings.get(def.path);
 
 	if (flags.json) {
-		console.log(JSON.stringify({ key: def.path, value: newValue }));
+		console.log(JSON.stringify({ key: def.path, ...(await jsonSettingValue(def, rawNewValue)) }));
 	} else {
-		console.log(chalk.green(`${theme.status.success} Set ${def.path} = ${formatValue(newValue)}`));
+		console.log(
+			chalk.green(
+				`${theme.status.success} Set ${def.path} = ${formatValue(await displaySettingValue(def, rawNewValue))}`,
+			),
+		);
 	}
 }
 
@@ -390,9 +448,13 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 	settings.set(path, defaultValue as SettingValue<typeof path>);
 
 	if (flags.json) {
-		console.log(JSON.stringify({ key: def.path, value: defaultValue }));
+		console.log(JSON.stringify({ key: def.path, ...(await jsonSettingValue(def, defaultValue)) }));
 	} else {
-		console.log(chalk.green(`${theme.status.success} Reset ${def.path} to ${formatValue(defaultValue)}`));
+		console.log(
+			chalk.green(
+				`${theme.status.success} Reset ${def.path} to ${formatValue(await displaySettingValue(def, defaultValue))}`,
+			),
+		);
 	}
 }
 

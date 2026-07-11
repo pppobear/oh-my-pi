@@ -221,6 +221,20 @@
 - Fixed the hover highlight sticking to the last hovered model row when the pointer moved into the provider sidebar
 
 ## [16.4.6] - 2026-07-12
+### Added
+
+- Added `memory.backend: openviking` for OpenViking-backed recall/retain, first-turn prompt injection, session capture, `/memory` status/search/save, and subagent memory aliasing.
+- Added OpenViking document reads through existing `memory://` internal URLs when the OpenViking backend is active.
+
+### Fixed
+
+- Fixed OpenViking write completion reporting by tracking asynchronous extraction tasks after synchronous archival, reconciling lost commit acknowledgements through persisted task baselines, reserving `stored` for completed non-empty extraction, boundedly waiting for explicit retains while keeping automatic capture in the background, and rejecting unsupported `/memory clear` operations without detaching live state.
+- Made OpenViking capture resumable across crashes and partial add/commit failures, and prevented session transitions or clears from silently dropping or uploading the wrong transcript tail.
+- Reconciled live OpenViking setting changes across parent and subagent sessions, including credentials, listeners, tools, and memory instructions before the next prompt.
+- Kept discovered OpenViking credentials bound to their matching server profile and masked secret settings in the interactive UI and config CLI output.
+### Breaking Changes
+
+- Reworked the task tool wire schema: the top-level `agent` field moved into each task item as `agent` (so one call can mix agent types), `assignment` was renamed `task`, `id` was renamed `name`, and the `role` and `description` fields were removed. The one-line UI label previously supplied via `description` is now generated automatically from the `task` text by the tiny/title model.
 
 ### Added
 
@@ -294,10 +308,6 @@
 - Fixed native Windows binary compatibility on older Windows 10 CPUs by building the `omp-windows-x64.exe` release asset with a baseline x64 runtime instead of AVX2. (#5172)
 - Fixed `GenerateImage` rejecting OpenAI Codex-compatible proxy bearer keys when the token does not expose a `chatgpt-account-id`. (#5174)
 - Fixed context promotion documentation to accurately reflect the `contextPromotionTarget` runtime behavior and `contextPromotion.enabled` default. (#5163)
-### Added
-
-- Added `memory.backend: openviking` for OpenViking-backed recall/retain, first-turn prompt injection, session capture, `/memory` status/search/save, and subagent memory aliasing.
-- Added OpenViking document reads through existing `memory://` internal URLs when the OpenViking backend is active.
 
 ## [16.4.3] - 2026-07-11
 

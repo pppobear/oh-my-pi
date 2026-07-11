@@ -1,7 +1,11 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { loadOpenVikingConfig } from "@oh-my-pi/pi-coding-agent/openviking/config";
 
 beforeAll(async () => {
 	await initTheme();
@@ -60,6 +64,47 @@ function focusMemoryTab(comp: SettingsSelectorComponent): void {
 	for (let i = 0; i < 4; i++) {
 		comp.handleInput("\x1b[C");
 	}
+}
+
+function replaceEnvironment(values: Record<string, string | undefined>): () => void {
+	const previous = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
+	for (const [key, value] of Object.entries(values)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	return () => {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	};
+}
+
+function renderPlain(comp: SettingsSelectorComponent, width = 140): string {
+	return comp
+		.render(width)
+		.map(line => line.replace(/\x1b\[[0-9;]*m/g, ""))
+		.join("\n");
+}
+
+async function waitForRender(
+	comp: SettingsSelectorComponent,
+	predicate: (rendered: string) => boolean,
+): Promise<string> {
+	for (let attempt = 0; attempt < 50; attempt++) {
+		const rendered = renderPlain(comp);
+		if (predicate(rendered)) return rendered;
+		await Bun.sleep(5);
+	}
+	throw new Error(`Timed out waiting for settings render:\n${renderPlain(comp)}`);
+}
+
+function selectSearchResultByDescription(comp: SettingsSelectorComponent, description: string): void {
+	for (let attempt = 0; attempt < 5; attempt++) {
+		if (renderPlain(comp).includes(description)) return;
+		comp.handleInput("\x1b[A");
+	}
+	throw new Error(`Could not select settings result described by ${description}`);
 }
 
 describe("SettingsSelectorComponent memory tab", () => {
@@ -196,5 +241,131 @@ describe("SettingsSelectorComponent memory tab", () => {
 
 		comp.handleInput("\x1b");
 		expect(cancelCount).toBe(1);
+	});
+
+	it("masks configured OpenViking API keys and never prefills the secret editor", () => {
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_API_KEY: undefined,
+			OPENVIKING_BEARER_TOKEN: undefined,
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-settings-selector-missing-ov.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-settings-selector-missing-ovcli.conf",
+		});
+		try {
+			const secret = "openviking-super-secret-value";
+			settings.set("memory.backend", "openviking");
+			settings.set("openviking.apiKey", secret);
+			const comp = createSelector();
+			for (const ch of "openviking api key") comp.handleInput(ch);
+
+			const list = renderPlain(comp);
+			expect(list).toContain("OpenViking API Key");
+			expect(list).toContain("(configured)");
+			expect(list).not.toContain(secret);
+
+			comp.handleInput("\n");
+			const editor = renderPlain(comp);
+			expect(editor).toContain("Empty + Enter to unset local value");
+			expect(editor).not.toContain(secret);
+
+			comp.handleInput("\x1b");
+			expect(settings.get("openviking.apiKey")).toBe(secret);
+
+			comp.handleInput("\n");
+			comp.handleInput("\n");
+			expect(settings.get("openviking.apiKey")).toBe("");
+		} finally {
+			restoreEnvironment();
+		}
+	});
+
+	it("edits file-derived OpenViking values from their effective value", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-settings-openviking-"));
+		const configPath = path.join(dir, "ov.conf");
+		await Bun.write(configPath, JSON.stringify({ claude_code: { autoRecall: false } }));
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_AUTO_RECALL: undefined,
+			OPENVIKING_CONFIG_FILE: configPath,
+			OPENVIKING_CLI_CONFIG_FILE: path.join(dir, "missing-ovcli.conf"),
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			const comp = createSelector();
+			for (const ch of "openviking auto recall") comp.handleInput(ch);
+			await waitForRender(
+				comp,
+				rendered => rendered.includes("OpenViking Auto Recall") && rendered.includes("false"),
+			);
+
+			// The schema default is true, but the active file profile says false.
+			// Cycling must start from false so the first action writes true.
+			expect(settings.get("openviking.autoRecall")).toBe(true);
+			selectSearchResultByDescription(comp, "Search OpenViking before each agent turn");
+			comp.handleInput("\n");
+			expect(settings.get("openviking.autoRecall")).toBe(true);
+			await waitForRender(comp, rendered => /OpenViking Auto Recall\s+true/.test(rendered));
+			const effective = await loadOpenVikingConfig(settings, {
+				OPENVIKING_CONFIG_FILE: configPath,
+				OPENVIKING_CLI_CONFIG_FILE: path.join(dir, "missing-ovcli.conf"),
+			});
+			expect(effective.autoRecall).toBe(true);
+		} finally {
+			restoreEnvironment();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("shows and disables OpenViking values controlled by environment variables", async () => {
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_AUTO_RECALL: "false",
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-settings-selector-missing-ov.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-settings-selector-missing-ovcli.conf",
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			const comp = createSelector();
+			for (const ch of "openviking auto recall") comp.handleInput(ch);
+			await waitForRender(comp, output => output.includes("false (OPENVIKING_AUTO_RECALL)"));
+			selectSearchResultByDescription(comp, "Controlled by OPENVIKING_AUTO_RECALL");
+			const rendered = renderPlain(comp);
+
+			expect(rendered).toContain("Controlled by OPENVIKING_AUTO_RECALL");
+			expect(settings.get("openviking.autoRecall")).toBe(true);
+			comp.handleInput("\n");
+			expect(settings.get("openviking.autoRecall")).toBe(true);
+		} finally {
+			restoreEnvironment();
+		}
+	});
+
+	it("keeps OpenViking settings editable when a boolean environment value is invalid", async () => {
+		const configPath = "/tmp/omp-settings-selector-invalid-env-missing-ov.conf";
+		const cliConfigPath = "/tmp/omp-settings-selector-invalid-env-missing-ovcli.conf";
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_AUTO_RECALL: "invalid",
+			OPENVIKING_CONFIG_FILE: configPath,
+			OPENVIKING_CLI_CONFIG_FILE: cliConfigPath,
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			settings.set("openviking.autoRecall", false);
+			const comp = createSelector();
+			for (const ch of "openviking auto recall") comp.handleInput(ch);
+			const before = await waitForRender(comp, output => /OpenViking Auto Recall\s+false/.test(output));
+
+			expect(before).not.toContain("Controlled by OPENVIKING_AUTO_RECALL");
+			selectSearchResultByDescription(comp, "Search OpenViking before each agent turn");
+			comp.handleInput("\n");
+			expect(settings.get("openviking.autoRecall")).toBe(true);
+			await waitForRender(comp, output => /OpenViking Auto Recall\s+true/.test(output));
+
+			const effective = await loadOpenVikingConfig(settings, {
+				OPENVIKING_AUTO_RECALL: "invalid",
+				OPENVIKING_CONFIG_FILE: configPath,
+				OPENVIKING_CLI_CONFIG_FILE: cliConfigPath,
+			});
+			expect(effective.autoRecall).toBe(true);
+		} finally {
+			restoreEnvironment();
+		}
 	});
 });

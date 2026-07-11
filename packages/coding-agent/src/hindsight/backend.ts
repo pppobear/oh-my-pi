@@ -80,7 +80,29 @@ export const hindsightBackend: MemoryBackend = {
 			return;
 		}
 
-		await installPrimaryState(session, settings, new Set());
+		const generation = advancePrimaryStateGeneration(session);
+		await installPrimaryState(session, settings, new Set(), generation);
+	},
+
+	async stop({ session }): Promise<void> {
+		advancePrimaryStateGeneration(session);
+		const rebuildTask = primaryRebuildTasks.get(session);
+		if (rebuildTask) rebuildTask.pending = false;
+		primaryRebuildTasks.delete(session);
+
+		let state = session.getHindsightSessionState();
+		while (state) {
+			await state.flushRetainQueue();
+			const current = session.getHindsightSessionState();
+			if (current !== state) {
+				state.dispose();
+				state = current;
+				continue;
+			}
+			session.setHindsightSessionState(undefined);
+			state.dispose();
+			return;
+		}
 	},
 
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
@@ -148,9 +170,21 @@ export const hindsightBackend: MemoryBackend = {
 };
 interface PrimaryRebuildTask {
 	pending: boolean;
+	generation: number;
 }
 
 const primaryRebuildTasks = new WeakMap<AgentSession, PrimaryRebuildTask>();
+const primaryStateGenerations = new WeakMap<AgentSession, number>();
+
+function advancePrimaryStateGeneration(session: AgentSession): number {
+	const generation = (primaryStateGenerations.get(session) ?? 0) + 1;
+	primaryStateGenerations.set(session, generation);
+	return generation;
+}
+
+function isPrimaryStateGenerationCurrent(session: AgentSession, generation: number): boolean {
+	return primaryStateGenerations.get(session) === generation;
+}
 
 /**
  * Coalesce and serialize live scope rebuilds for one session. Cwd reloads fire
@@ -165,14 +199,17 @@ function schedulePrimaryStateRebuild(session: AgentSession): void {
 		return;
 	}
 
-	const nextTask: PrimaryRebuildTask = { pending: true };
+	const nextTask: PrimaryRebuildTask = {
+		pending: true,
+		generation: primaryStateGenerations.get(session) ?? 0,
+	};
 	primaryRebuildTasks.set(session, nextTask);
 	void Promise.resolve()
 		.then(async () => {
-			while (nextTask.pending) {
+			while (nextTask.pending && isPrimaryStateGenerationCurrent(session, nextTask.generation)) {
 				nextTask.pending = false;
 				try {
-					await rebuildPrimaryStateOnScopeChange(session);
+					await rebuildPrimaryStateOnScopeChange(session, nextTask.generation);
 				} catch (err) {
 					logger.warn("Hindsight: scope rebuild failed", { error: String(err) });
 				}
@@ -199,7 +236,9 @@ async function installPrimaryState(
 	session: AgentSession,
 	settings: Settings,
 	banksSet: Set<string>,
+	generation: number,
 ): Promise<HindsightSessionState | undefined> {
+	if (!isPrimaryStateGenerationCurrent(session, generation)) return undefined;
 	const sessionId = session.sessionId;
 	if (!sessionId) return undefined;
 
@@ -225,6 +264,7 @@ async function installPrimaryState(
 		previous = latest;
 		await previous.flushRetainQueue();
 	}
+	if (!isPrimaryStateGenerationCurrent(session, generation)) return undefined;
 
 	const state = new HindsightSessionState({
 		sessionId,
@@ -251,6 +291,13 @@ async function installPrimaryState(
 		await displaced.flushRetainQueue();
 		displaced.dispose();
 	}
+	const installedState = session.getHindsightSessionState();
+	if (!isPrimaryStateGenerationCurrent(session, generation) || installedState !== state) {
+		if (installedState === state) session.setHindsightSessionState(undefined);
+		state.dispose();
+		previous?.dispose();
+		return undefined;
+	}
 	previous?.dispose();
 	state.attachSessionListeners();
 
@@ -273,16 +320,20 @@ async function installPrimaryState(
  * when the scope is unchanged or the session is no longer hosting a primary
  * state (e.g. it was wiped to `undefined`, or this is a subagent alias).
  */
-async function rebuildPrimaryStateOnScopeChange(session: AgentSession): Promise<void> {
+async function rebuildPrimaryStateOnScopeChange(session: AgentSession, generation: number): Promise<void> {
+	if (!isPrimaryStateGenerationCurrent(session, generation)) return;
 	const current = session.getHindsightSessionState();
 	if (!current || current.aliasOf) return;
 
 	const settings = session.settings;
+	if (settings.get("memory.backend") !== "hindsight") return;
 	const config = loadHindsightConfig(settings);
 	if (!isHindsightConfigured(config)) {
 		// Hindsight effectively unwired mid-session. Flush before clearing so
 		// queued retains don't get dropped by `HindsightRetainQueue.#doFlush`.
 		await current.flushRetainQueue();
+		if (!isPrimaryStateGenerationCurrent(session, generation)) return;
+		if (session.getHindsightSessionState() !== current) return;
 		const previous = session.setHindsightSessionState(undefined);
 		previous?.dispose();
 		return;
@@ -292,7 +343,7 @@ async function rebuildPrimaryStateOnScopeChange(session: AgentSession): Promise<
 	if (bankScopesEqual(next, current)) return;
 
 	// Preserve the banksSet so we don't re-PUT banks we've already confirmed.
-	await installPrimaryState(session, settings, current.banksSet);
+	await installPrimaryState(session, settings, current.banksSet, generation);
 }
 
 /** Tag-array equality: order matters because we never reorder on the way in. */

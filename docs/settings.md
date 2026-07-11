@@ -67,6 +67,8 @@ This only controls the startup splash animation. It does not rerun setup or chan
 
 `omp config` with no subcommand, or `--help`, prints the help and lists settings. The `--json` flag is accepted by `list`, `get`, `set`, and `reset`.
 
+Secret settings are never returned verbatim. Text output shows `(configured)` or `(not set)`; JSON keeps `value: null` and adds `configured` plus `redacted: true` so callers can distinguish presence without receiving the secret. Presence checks include supported environment overrides; OpenViking also includes the matching `ovcli.conf` profile.
+
 ### Value parsing
 
 `omp config set` parses the value string according to the target key's schema type. The string is trimmed first.
@@ -538,7 +540,7 @@ compaction:
   remoteEnabled: true
 
 memory:
-  backend: off               # off, local, hindsight, mnemopi
+  backend: off               # off, local, hindsight, mnemopi, openviking
 ```
 
 | Key | Type | Default | Notes |
@@ -553,7 +555,7 @@ memory:
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens always preserved. |
 | `compaction.remoteEnabled` | boolean | `true` | Allow remote compaction service. |
 | `compaction.autoContinue` | boolean | `true` | Continue automatically after compaction. |
-| `memory.backend` | enum | `off` | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys. |
+| `memory.backend` | enum | `off` | `off`, `local`, `hindsight`, `mnemopi`, `openviking`. Each backend has its own `hindsight.*` / `mnemopi.*` / `openviking.*` / `memories.*` tuning keys. |
 | `autolearn.enabled` | boolean | `false` | Experimental: after the agent stops, nudge it to capture lessons to memory and create/enhance isolated managed skills under `~/.omp/agent/managed-skills`. Enables the `manage_skill` tool (and `learn` when a memory backend is active). |
 | `autolearn.autoContinue` | boolean | `false` | When `autolearn.enabled`, auto-run one capture turn at stop (uses extra tokens). Off = a passive reminder rides your next turn. |
 | `autolearn.minToolCalls` | number | `5` | Only nudge after a turn that used at least this many tools. |
@@ -670,7 +672,7 @@ Provider credentials and custom model definitions are configured separately — 
 
 ### Other groups
 
-`omp config list` exposes many more grouped settings, including: `task.*` (subagent concurrency, isolation, model overrides), `skills.*` and `commands.*` (discovery toggles), `mcp.*`, `github.*`, `async.*`, `goal.*`, `loop.*`, `todo.*`, `magicKeywords.*`, `ttsr.*` (time-traveling stream rules), `display.*`, `startup.*`, `share.*`, `collab.*`, `stt.*`/`tts.*`, `memories.*`/`hindsight.*`/`mnemopi.*` (memory backends), and `bashInterceptor.*`. Each follows the same type/default rules shown above.
+`omp config list` exposes many more grouped settings, including: `task.*` (subagent concurrency, isolation, model overrides), `skills.*` and `commands.*` (discovery toggles), `mcp.*`, `github.*`, `async.*`, `goal.*`, `loop.*`, `todo.*`, `magicKeywords.*`, `ttsr.*` (time-traveling stream rules), `display.*`, `startup.*`, `share.*`, `collab.*`, `stt.*`/`tts.*`, `memories.*`/`hindsight.*`/`mnemopi.*`/`openviking.*` (memory backends), and `bashInterceptor.*`. Each follows the same type/default rules shown above.
 
 ## Legacy migration
 

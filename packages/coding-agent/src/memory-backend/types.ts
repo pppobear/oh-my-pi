@@ -3,7 +3,8 @@
  *
  * Backends are mutually exclusive — `await resolveMemoryBackend(settings)` returns
  * exactly one. Implementations MUST be self-contained: they own the per-session
- * state they create in `start()` and tear it down on `clear()`.
+ * state they create in `start()`. A backend without a safe bulk-delete contract may
+ * reject `clear()` and preserve that state; callers must surface the rejection.
  */
 
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
@@ -94,17 +95,28 @@ export interface MemoryBackendStartOptions {
 	parentOpenVikingSessionState?: OpenVikingSessionState;
 }
 
+export interface MemoryBackendStopOptions {
+	session: AgentSession;
+}
+
 export interface MemoryBackend {
 	readonly id: MemoryBackendId;
 
 	/**
 	 * Wire any background work or session subscriptions for this backend.
 	 *
-	 * Called once per agent session at startup. Implementations MUST be
+	 * Called at startup and again when a live session switches to this backend.
+	 * Implementations MUST be
 	 * non-throwing: failures should be logged and swallowed so a misconfigured
 	 * memory backend cannot break the agent loop.
 	 */
 	start(options: MemoryBackendStartOptions): void | Promise<void>;
+
+	/**
+	 * Release this backend's state for one live session without deleting durable
+	 * memory. Runtime backend switches call this before starting the replacement.
+	 */
+	stop?(options: MemoryBackendStopOptions): void | Promise<void>;
 
 	/**
 	 * Markdown injected as the system-prompt append section.
@@ -116,7 +128,7 @@ export interface MemoryBackend {
 		session?: AgentSession,
 	): Promise<string | undefined>;
 
-	/** Wipe all persisted state for this backend (slash `/memory clear`). */
+	/** Wipe persisted state, or reject when this backend cannot safely implement bulk clear (`/memory clear`). */
 	clear(agentDir: string, cwd: string, session?: AgentSession): Promise<void>;
 
 	/** Force consolidation/retain to happen now (slash `/memory enqueue`). */

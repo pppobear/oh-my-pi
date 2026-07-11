@@ -24,12 +24,10 @@ const DEFAULT_MIN_TOOL_CALLS = 5;
  * Build the standing auto-learn guidance for the system prompt from the tools
  * actually present in the active set, or null when `manage_skill` is absent.
  *
- * Driven by tool presence rather than live settings: the `learn`/`manage_skill`
- * registry is built ONCE at session start (and only for top-level sessions), so
- * keying the guidance on `autolearn.enabled` would let a mid-session enable — or
- * a subagent that filtered the tools out — inject guidance pointing at tools the
- * session never built. The `learn` addendum is included only when the `learn`
- * tool is present (it requires a memory backend).
+ * Driven by tool presence rather than live settings: `manage_skill` is a
+ * top-level session-start decision, while `learn` can be added or removed when
+ * the memory backend changes. The addendum is included only while `learn` is
+ * actually registered.
  */
 export function buildAutoLearnInstructions(available: { manageSkill: boolean; learn: boolean }): string | null {
 	if (!available.manageSkill) return null;

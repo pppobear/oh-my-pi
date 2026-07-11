@@ -15,11 +15,13 @@ Package-specific references:
 
 ## Memory backends
 
-The agent supports three mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.omp/config.yml`):
+The agent supports five mutually-exclusive memory backends, selected via the `memory.backend` setting (Settings → Memory tab, or `~/.omp/config.yml`):
 
 - `off` (default) — no memory subsystem runs.
 - `local` — existing rollout-summarisation pipeline; writes `memory_summary.md` and consolidated artifacts under the agent dir.
 - `hindsight` — talks to a [Hindsight](https://hindsight.vectorize.io) server (Cloud or self-hosted Docker), retains transcripts every Nth user turn, recalls memories on the first turn of a session, and exposes `retain`, `recall`, and `reflect`.
+- `mnemopi` — stores and searches scoped long-term memory in a local SQLite database, with `memory_edit`, `retain`, `recall`, and `reflect` tools.
+- `openviking` — talks to an OpenViking server, captures session turns, injects first-turn recall, exposes `retain`, `recall`, and `reflect`, and reads OpenViking resources through `memory://`.
 
 ### Hindsight quickstart
 
@@ -32,4 +34,17 @@ The agent supports three mutually-exclusive memory backends, selected via the `m
    - `HINDSIGHT_RECALL_BUDGET`, `HINDSIGHT_RECALL_MAX_TOKENS` — recall sizing
    - `HINDSIGHT_BANK_MISSION`, `HINDSIGHT_DEBUG`
 
-Switching backends mid-session is honoured on the next system-prompt rebuild and the next `/memory` slash command. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch.
+### OpenViking quickstart
+
+1. Start an OpenViking server or configure the official CLI in `~/.openviking/ovcli.conf`.
+2. Set `memory.backend = "openviking"`. The agent discovers the server URL and matching credentials from `ovcli.conf`; explicit `openviking.*` settings take precedence.
+3. Optional environment overrides (env wins over settings):
+   - `OPENVIKING_URL`, `OPENVIKING_BEARER_TOKEN` or `OPENVIKING_API_KEY` — connection
+   - `OPENVIKING_ACCOUNT`, `OPENVIKING_USER`, `OPENVIKING_PEER_ID` — tenant identity
+   - `OPENVIKING_AUTO_RECALL`, `OPENVIKING_AUTO_CAPTURE`, `OPENVIKING_RECALL_LIMIT` — lifecycle and recall
+
+OpenViking commits have two phases. The server archives new session messages synchronously, then extracts durable memories in an asynchronous task. Explicit `retain` and `learn` calls poll that task for a bounded time and distinguish created memories, zero-memory completion, failure, a known queue, and unavailable/interrupted task status; automatic transcript capture accepts the archive and monitors extraction in the background so it does not block session transitions.
+
+`/memory clear` and `/memory reset` are intentionally unsupported with the OpenViking backend. Memories are server-side resources that require resource-scoped deletion in OpenViking; the agent rejects a bulk clear and preserves its active session state instead of pretending remote data was deleted.
+
+Changing `memory.backend` or an `openviking.*` connection setting in the interactive Settings panel reconciles live parent and subagent state, tools, credentials, and memory instructions before the next prompt or `/memory` operation. Existing users with `memories.enabled = true|false` are migrated to `memory.backend = "local"|"off"` exactly once on first launch.

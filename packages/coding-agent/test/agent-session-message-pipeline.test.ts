@@ -675,10 +675,11 @@ describe("AgentSession message pipeline", () => {
 		await Bun.sleep(0);
 	});
 
-	it("keeps first-turn memory in the stable prompt on the next turn", async () => {
+	it("keeps first-turn memory until a later recall returns no context", async () => {
 		const api = "test-injected-memory-append-only-cache";
 		const contexts: Context[] = [];
 		let remembered = false;
+		let recallAvailable = true;
 		const injected = "<memories>remember blue</memories>";
 		const fakeBackend: MemoryBackend = {
 			id: "mnemopi",
@@ -689,6 +690,10 @@ describe("AgentSession message pipeline", () => {
 			async clear() {},
 			async enqueue() {},
 			async beforeAgentStartPrompt() {
+				if (!recallAvailable) {
+					remembered = false;
+					return undefined;
+				}
 				if (remembered) return undefined;
 				remembered = true;
 				return injected;
@@ -747,6 +752,12 @@ describe("AgentSession message pipeline", () => {
 		expect(firstSystemPrompt).toBeDefined();
 		expect(firstSystemPrompt!.join("\n")).toContain(injected);
 		expect(contexts[1]!.systemPrompt).toEqual(firstSystemPrompt);
+
+		recallAvailable = false;
+		await session.sendUserMessage("third");
+
+		expect(contexts).toHaveLength(3);
+		expect(contexts[2]!.systemPrompt?.join("\n")).not.toContain(injected);
 	});
 
 	it("preserves append-only prefixes in subagent sessions when context handlers rewrite prior turns", async () => {

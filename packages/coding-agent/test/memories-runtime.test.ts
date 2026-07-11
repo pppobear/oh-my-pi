@@ -11,6 +11,7 @@ import {
 	startMemoryStartupTask,
 } from "@oh-my-pi/pi-coding-agent/memories";
 import * as memoryStorage from "@oh-my-pi/pi-coding-agent/memories/storage";
+import { localBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/local-backend";
 import { getAgentDbPath, Snowflake, TempDir } from "@oh-my-pi/pi-utils";
 
 interface SessionFixture {
@@ -185,6 +186,48 @@ describe("memories runtime", () => {
 
 		await flushAsync();
 		expect(stage1Spy).not.toHaveBeenCalled();
+	});
+
+	test("local backend stop aborts and drains an in-flight startup pipeline", async () => {
+		const fx = await createFixture({ "memory.backend": "local" });
+		const rolloutPath = path.join(fx.sessionDir, "thread-stop.jsonl");
+		const rolloutRows = [
+			{ type: "session", id: "thread-stop", cwd: fx.agentDir },
+			{ type: "message", message: { role: "user", content: "cancel this memory startup" } },
+		];
+		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
+
+		const started = Promise.withResolvers<void>();
+		const aborted = Promise.withResolvers<void>();
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, _context, options) => {
+			const signal = options?.signal;
+			if (!signal) throw new Error("memory startup did not receive an abort signal");
+			started.resolve();
+			const blocked = Promise.withResolvers<never>();
+			const onAbort = () => {
+				aborted.resolve();
+				blocked.reject(signal.reason);
+			};
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+			return await blocked.promise;
+		});
+
+		localBackend.start({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+		await settle(started.promise, "local memory startup dispatch");
+
+		const stopping = localBackend.stop!({ session: fx.session });
+		await settle(aborted.promise, "local memory startup abort");
+		await stopping;
+
+		expect(completeSpy).toHaveBeenCalledTimes(1);
+		expect(fx.session.refreshBaseSystemPrompt).not.toHaveBeenCalled();
 	});
 
 	test("runs phase1 to phase2 and writes consolidated outputs", async () => {

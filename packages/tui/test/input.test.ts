@@ -31,6 +31,14 @@ describe("Input component", () => {
 		resetHangulCompatibilityJamoWidthForTests();
 	});
 
+	it("sanitizes programmatic values for single-line rendering", () => {
+		const input = new Input();
+		input.setValue("https://example.test\tpath\r\nnext\x1b[2Jhidden\x07");
+
+		expect(input.getValue()).toBe(`https://example.test${" ".repeat(DEFAULT_TAB_WIDTH)}path nexthidden`);
+		expect(Bun.stripANSI(input.render(100).join("\n"))).not.toMatch(/[\r\n\t\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+	});
+
 	it("moves by CJK and punctuation blocks (backward)", () => {
 		const text = "天气不错，去散步吧！";
 

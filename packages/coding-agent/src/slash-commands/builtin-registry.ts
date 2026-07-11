@@ -1614,6 +1614,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
+			await runtime.session.waitForMemoryBackendReconcile();
 			const backend = await resolveMemoryBackend(runtime.settings);
 			switch (verb) {
 				case "view": {
@@ -1627,15 +1628,27 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				}
 				case "clear":
 				case "reset": {
-					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
-					await runtime.session.refreshBaseSystemPrompt();
-					await runtime.output("Memory cleared.");
+					try {
+						await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+						await runtime.session.refreshBaseSystemPrompt();
+						await runtime.output("Memory cleared.");
+					} catch (error) {
+						await runtime.output(
+							`Memory clear failed: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
 					return commandConsumed();
 				}
 				case "enqueue":
 				case "rebuild": {
-					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
-					await runtime.output("Memory consolidation enqueued.");
+					try {
+						await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+						await runtime.output("Memory consolidation enqueued.");
+					} catch (error) {
+						await runtime.output(
+							`Memory enqueue failed: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
 					return commandConsumed();
 				}
 				case "stats":

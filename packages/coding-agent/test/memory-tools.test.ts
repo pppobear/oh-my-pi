@@ -24,6 +24,7 @@ import {
 	MnemopiSessionState,
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
+import type { OpenVikingSessionState } from "@oh-my-pi/pi-coding-agent/openviking/state";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { MemoryEditTool } from "@oh-my-pi/pi-coding-agent/tools/memory-edit";
 import { MemoryRecallTool } from "@oh-my-pi/pi-coding-agent/tools/memory-recall";
@@ -39,6 +40,7 @@ await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 const TEST_SESSION_ID = "test-session-id";
 let registeredState: HindsightSessionState | undefined;
 let registeredMnemopiState: MnemopiSessionState | undefined;
+let registeredOpenVikingState: OpenVikingSessionState | undefined;
 let tempDbPath: string | undefined;
 let tempDbDir: TempDir | undefined;
 
@@ -82,6 +84,7 @@ function makeSession(settings: Settings, sessionId: string | null = TEST_SESSION
 		getSessionSpawns: () => null,
 		getHindsightSessionState: () => (sessionId === TEST_SESSION_ID ? registeredState : undefined),
 		getMnemopiSessionState: () => (sessionId === TEST_SESSION_ID ? registeredMnemopiState : undefined),
+		getOpenVikingSessionState: () => (sessionId === TEST_SESSION_ID ? registeredOpenVikingState : undefined),
 	} as unknown as ToolSession;
 }
 
@@ -330,6 +333,115 @@ describe("retain.execute", () => {
 		const settings = Settings.isolated({ "memory.backend": "hindsight" });
 		const tool = MemoryRetainTool.createIf(makeSession(settings))!;
 		await expect(tool.execute("call-2", { items: [{ content: "x" }] })).rejects.toThrow(/not initialised/i);
+	});
+});
+
+describe("retain.execute (OpenViking backend)", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredOpenVikingState = undefined;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		registeredOpenVikingState = undefined;
+	});
+
+	it("reports the task's extracted count instead of the requested item count", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const saveMany = vi.fn(async () => ({
+			status: "stored" as const,
+			taskId: "task-1",
+			archiveUri: "viking://session/archive",
+			extracted: 2,
+		}));
+		registeredOpenVikingState = { saveMany } as unknown as OpenVikingSessionState;
+
+		const result = await MemoryRetainTool.createIf(makeSession(settings))?.execute("openviking-stored", {
+			items: [{ content: "one" }, { content: "two" }, { content: "three" }],
+		});
+
+		expect(result?.content[0]).toEqual({ type: "text", text: "2 memories stored." });
+		expect(result?.details).toEqual({ count: 2 });
+		expect(saveMany).toHaveBeenCalledTimes(1);
+	});
+
+	it("reports a bounded Phase 2 wait as queued", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		registeredOpenVikingState = {
+			saveMany: vi.fn(async () => ({
+				status: "queued" as const,
+				taskId: "task-1",
+				archiveUri: "viking://session/archive",
+				reason: "timeout" as const,
+				message: "OpenViking archived the write and memory extraction is still queued.",
+			})),
+		} as unknown as OpenVikingSessionState;
+
+		const result = await MemoryRetainTool.createIf(makeSession(settings))?.execute("openviking-queued", {
+			items: [{ content: "one" }, { content: "two" }],
+		});
+
+		expect(result?.content[0]).toEqual({ type: "text", text: "2 memories queued for extraction." });
+		expect(result?.details).toEqual({ count: 2, queued: true });
+	});
+
+	it("distinguishes unavailable extraction status from a known queue", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		registeredOpenVikingState = {
+			saveMany: vi.fn(async () => ({
+				status: "queued" as const,
+				taskId: "task-1",
+				archiveUri: "viking://session/archive",
+				reason: "unknown" as const,
+				message: "OpenViking archived the write, but extraction status is temporarily unknown.",
+			})),
+		} as unknown as OpenVikingSessionState;
+
+		const result = await MemoryRetainTool.createIf(makeSession(settings))?.execute("openviking-unknown", {
+			items: [{ content: "one" }, { content: "two" }],
+		});
+
+		expect(result?.content[0]).toEqual({
+			type: "text",
+			text: "2 memory inputs archived; extraction status unavailable.",
+		});
+		expect(result?.details).toEqual({ count: 2 });
+	});
+
+	it("does not claim stored when extraction completes with zero memories", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		registeredOpenVikingState = {
+			saveMany: vi.fn(async () => ({
+				status: "completed" as const,
+				taskId: "task-1",
+				archiveUri: "viking://session/archive",
+				extracted: 0,
+			})),
+		} as unknown as OpenVikingSessionState;
+
+		const result = await MemoryRetainTool.createIf(makeSession(settings))?.execute("openviking-empty", {
+			items: [{ content: "one" }],
+		});
+
+		expect(result?.content[0]).toEqual({
+			type: "text",
+			text: "0 memories stored; OpenViking completed extraction without creating a durable memory.",
+		});
+		expect(result?.details).toEqual({ count: 0 });
+	});
+
+	it("surfaces extraction failures", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		registeredOpenVikingState = {
+			saveMany: vi.fn(async () => ({ status: "failed" as const, error: "OpenViking memory extraction failed" })),
+		} as unknown as OpenVikingSessionState;
+
+		await expect(
+			MemoryRetainTool.createIf(makeSession(settings))?.execute("openviking-failed", {
+				items: [{ content: "one" }],
+			}),
+		).rejects.toThrow("OpenViking memory extraction failed");
 	});
 });
 

@@ -35,6 +35,15 @@ export const HIDDEN_TOOL_NAMES = ["yield", "goal"] as const;
 
 export type HiddenToolName = (typeof HIDDEN_TOOL_NAMES)[number];
 
+/** Built-ins whose availability changes with the live memory backend. */
+export const MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES = [
+	"memory_edit",
+	"retain",
+	"recall",
+	"reflect",
+	"learn",
+] as const satisfies readonly BuiltinToolName[];
+
 const LEGACY_BUILTIN_TOOL_NAME_ALIASES: ReadonlyMap<string, BuiltinToolName> = new Map([
 	["search", "grep"],
 	["find", "glob"],

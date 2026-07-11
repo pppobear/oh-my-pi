@@ -35,27 +35,81 @@ export const openVikingBackend: MemoryBackend = {
 					aliasOf: parent,
 				}),
 			);
-			previous?.dispose();
+			await previous?.dispose({ flush: false });
 			return;
 		}
 
 		try {
 			const config = await loadOpenVikingConfig(settings);
 			const client = new OpenVikingApi(config);
-			const state = new OpenVikingSessionState({ sessionId, config, client, session });
-			const ensured = await client.ensureSession(state.sessionId);
+			const startingBranchIds = session.sessionManager.getBranch().map(entry => entry.id);
+			const transcriptStillCurrent = (): boolean => {
+				if (session.sessionId !== sessionId) return false;
+				const currentBranch = session.sessionManager.getBranch();
+				return startingBranchIds.every((id, index) => currentBranch[index]?.id === id);
+			};
+			const candidate = new OpenVikingSessionState({ sessionId, config, client, session });
+			const ensured = await client.ensureSession(candidate.sessionId);
 			if (!ensured.ok) throw new Error(ensured.error ?? `HTTP ${ensured.status ?? "unknown"}`);
-			const previous = setOpenVikingSessionState(session, state);
-			previous?.dispose();
+			// A session transition may have won while the remote ensure was in
+			// flight. Never install state whose remote id belongs to the old
+			// transcript; the transition/reconcile caller will retry for the live id.
+			if (!transcriptStillCurrent()) {
+				await candidate.dispose({ flush: false });
+				return;
+			}
+			const previous = getOpenVikingSessionState(session);
+			if (previous) {
+				if (!(await previous.flushAndCommit()))
+					throw new Error("existing OpenViking session tail could not be flushed");
+				await session.sessionManager.flush();
+				await previous.dispose({ flush: false });
+			}
+			if (!transcriptStillCurrent()) {
+				if (previous && getOpenVikingSessionState(session) === previous) {
+					setOpenVikingSessionState(session, undefined);
+				}
+				await candidate.dispose({ flush: false });
+				return;
+			}
+			// Re-read the cursor after the previous state has durably advanced it.
+			const state = previous ? new OpenVikingSessionState({ sessionId, config, client, session }) : candidate;
+			setOpenVikingSessionState(session, state);
 			state.attachSessionListeners();
 		} catch (error) {
 			logger.warn("OpenViking: backend start failed", { error: String(error) });
 		}
 	},
 
+	async stop({ session }): Promise<void> {
+		const state = getOpenVikingSessionState(session);
+		if (!state) return;
+		try {
+			if (!(await state.flushAndCommit())) {
+				logger.warn("OpenViking: runtime switch left a resumable transcript tail", {
+					sessionId: state.sessionId,
+				});
+			}
+			await session.sessionManager.flush();
+		} catch (error) {
+			// Runtime settings changes do not replace the SessionManager transcript.
+			// Detaching is safe: the persisted capture cursor (or an at-least-once
+			// replay when it could not be flushed) retries this tail if the profile is
+			// activated again. This also lets a corrected API key replace a broken one.
+			logger.warn("OpenViking: runtime switch could not flush the current tail", {
+				sessionId: state.sessionId,
+				error: String(error),
+			});
+		}
+		if (getOpenVikingSessionState(session) !== state) return;
+		setOpenVikingSessionState(session, undefined);
+		await state.dispose({ flush: false });
+	},
+
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
 		if (settings.get("memory.backend") !== "openviking") return undefined;
 		const state = getOpenVikingSessionState(session);
+		if (!state?.isReady) return undefined;
 		const primary = state?.aliasOf ?? state;
 		const parts = [STATIC_INSTRUCTIONS];
 		if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
@@ -67,19 +121,18 @@ export const openVikingBackend: MemoryBackend = {
 		return await state?.beforeAgentStartPrompt(promptText);
 	},
 
-	async clear(_agentDir, _cwd, session): Promise<void> {
-		const previous = session ? setOpenVikingSessionState(session, undefined) : undefined;
-		previous?.dispose();
-		logger.warn(
-			"OpenViking memory is server-side; only the local OpenViking session cache was cleared. " +
-				"Delete the corresponding user memory resources from OpenViking to wipe upstream state.",
+	async clear(): Promise<void> {
+		throw new Error(
+			"OpenViking memory is server-side; /memory clear is not supported. Delete specific memory resources in OpenViking instead.",
 		);
 	},
 
 	async enqueue(_agentDir, _cwd, session): Promise<void> {
 		const state = getOpenVikingSessionState(session);
 		const primary = state?.aliasOf ? undefined : state;
-		await primary?.forceRetainCurrentSession();
+		if (primary && !(await primary.forceRetainCurrentSession())) {
+			throw new Error("OpenViking could not capture and archive the current session tail.");
+		}
 	},
 
 	async status({ session }): Promise<{
@@ -168,12 +221,32 @@ export const openVikingBackend: MemoryBackend = {
 				message: "OpenViking backend is not initialised for this session.",
 			};
 		}
-		const ok = await primary.save(input.content, input.context);
-		return {
-			backend: "openviking" as const,
-			stored: ok ? 1 : 0,
-			message: ok ? undefined : "OpenViking did not acknowledge the memory write.",
-		};
+		const outcome = await primary.save(input.content, input.context);
+		if (outcome.status === "stored") {
+			return { backend: "openviking" as const, stored: outcome.extracted };
+		}
+		if (outcome.status === "completed") {
+			return {
+				backend: "openviking" as const,
+				stored: 0,
+				message:
+					outcome.extracted === 0
+						? "OpenViking completed extraction without creating a durable memory."
+						: "OpenViking completed extraction, but did not report a durable-memory count.",
+			};
+		}
+		if (outcome.status === "reconciling") {
+			return { backend: "openviking" as const, stored: 0, message: outcome.message };
+		}
+		if (outcome.status === "queued") {
+			return {
+				backend: "openviking" as const,
+				stored: 0,
+				...(outcome.reason === "timeout" ? { queued: true } : {}),
+				message: outcome.message,
+			};
+		}
+		return { backend: "openviking" as const, stored: 0, message: outcome.error };
 	},
 
 	async preCompactionContext(messages: AgentMessage[], settings: Settings, session): Promise<string | undefined> {

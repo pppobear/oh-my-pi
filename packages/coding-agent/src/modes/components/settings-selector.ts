@@ -29,6 +29,7 @@ import type { ShapeTarget } from "@oh-my-pi/snapcompact";
 import {
 	getDefault,
 	getType,
+	getUi,
 	normalizeProviderMaxInFlightRequests,
 	type SettingPath,
 	settings,
@@ -42,7 +43,7 @@ import type {
 } from "../../config/settings-schema";
 import { SETTING_TABS, TAB_METADATA } from "../../config/settings-schema";
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
-import { loadOpenVikingConfig, type OpenVikingConfig } from "../../openviking/config";
+import { getOpenVikingEnvironmentVariable, loadOpenVikingConfig, type OpenVikingConfig } from "../../openviking/config";
 import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
 import { getTabBarTheme } from "../shared";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
@@ -68,6 +69,7 @@ class TextInputSubmenu extends Container {
 		currentValue: string,
 		private readonly onSubmit: (value: string) => void,
 		private readonly onCancel: () => void,
+		secret = false,
 	) {
 		super();
 
@@ -94,7 +96,10 @@ class TextInputSubmenu extends Container {
 		this.addChild(this.#input);
 		this.addChild(new Spacer(1));
 		this.addChild(this.#error);
-		this.addChild(new Text(theme.fg("dim", "  Enter to save · Esc to cancel · Clear field to unset"), 0, 0));
+		const hint = secret
+			? "  Enter to replace · Empty + Enter to unset local value · Esc to keep current value"
+			: "  Enter to save · Esc to cancel · Clear field to unset";
+		this.addChild(new Text(theme.fg("dim", hint), 0, 0));
 	}
 
 	handleInput(data: string): void {
@@ -839,17 +844,30 @@ export class SettingsSelectorComponent implements Component {
 
 		const currentValue = this.#getCurrentValue(def);
 		const changed = this.#isChanged(def, currentValue);
-		const displayValue = this.#getOpenVikingEffectiveDisplayValue(def.path);
+		const effectiveValue = this.#getOpenVikingEffectiveDisplayValue(def.path);
+		const environmentVariable = getOpenVikingEnvironmentVariable(def.path);
+		const editable = environmentVariable === undefined;
+		const displayValue = environmentVariable
+			? effectiveValue === undefined
+				? undefined
+				: this.#isSecretSetting(def.path)
+					? `(configured via ${environmentVariable})`
+					: `${effectiveValue} (${environmentVariable})`
+			: effectiveValue;
+		const description = environmentVariable
+			? `${def.description} Controlled by ${environmentVariable}; edit or unset that environment variable to change it.`
+			: def.description;
+		const editingValue = effectiveValue ?? currentValue;
 
 		switch (def.type) {
 			case "boolean":
 				return {
 					id: def.path,
 					label: def.label,
-					description: def.description,
-					currentValue: currentValue ? "true" : "false",
+					description,
+					currentValue: String(editingValue ?? false),
 					displayValue,
-					values: ["true", "false"],
+					values: editable ? ["true", "false"] : undefined,
 					changed,
 				};
 
@@ -857,10 +875,10 @@ export class SettingsSelectorComponent implements Component {
 				return {
 					id: def.path,
 					label: def.label,
-					description: def.description,
-					currentValue: String(currentValue ?? ""),
+					description,
+					currentValue: String(editingValue ?? ""),
 					displayValue,
-					values: [...def.values],
+					values: editable ? [...def.values] : undefined,
 					changed,
 				};
 
@@ -868,10 +886,10 @@ export class SettingsSelectorComponent implements Component {
 				return {
 					id: def.path,
 					label: def.label,
-					description: def.description,
-					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
+					description,
+					currentValue: this.#getSubmenuCurrentValue(def.path, editingValue),
 					displayValue,
-					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
+					submenu: editable ? (cv, done) => this.#createSubmenu(def, cv, done) : undefined,
 					changed,
 				};
 
@@ -879,10 +897,10 @@ export class SettingsSelectorComponent implements Component {
 				return {
 					id: def.path,
 					label: def.label,
-					description: def.description,
-					currentValue: this.#formatTextInputValue(def.path, currentValue),
+					description,
+					currentValue: this.#formatTextInputValue(def.path, editingValue),
 					displayValue,
-					submenu: (cv, done) => this.#createTextInput(def, cv, done),
+					submenu: editable ? (cv, done) => this.#createTextInput(def, cv, done) : undefined,
 					changed,
 				};
 
@@ -907,6 +925,10 @@ export class SettingsSelectorComponent implements Component {
 
 	#isChanged(def: SettingDef, currentValue: unknown): boolean {
 		return !Object.is(currentValue, getDefault(def.path));
+	}
+
+	#isSecretSetting(path: SettingPath): boolean {
+		return getUi(path)?.secret === true;
 	}
 
 	#getOpenVikingEffectiveDisplayValue(path: SettingPath): string | undefined {
@@ -1072,7 +1094,7 @@ export class SettingsSelectorComponent implements Component {
 	 */
 	#createTextInput(
 		def: SettingDef & { type: "text" },
-		_currentValue: string,
+		currentValue: string,
 		done: (value?: string) => void,
 	): Container {
 		this.#textInputActive = true;
@@ -1083,7 +1105,7 @@ export class SettingsSelectorComponent implements Component {
 		return new TextInputSubmenu(
 			def.label,
 			def.description,
-			this.#formatTextInputEditValue(def.path, settings.get(def.path)),
+			this.#formatTextInputEditValue(def.path, currentValue),
 			value => {
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
@@ -1092,6 +1114,7 @@ export class SettingsSelectorComponent implements Component {
 				wrappedDone(this.#formatTextInputValue(def.path, settings.get(def.path)));
 			},
 			() => wrappedDone(),
+			this.#isSecretSetting(def.path),
 		);
 	}
 
@@ -1116,10 +1139,12 @@ export class SettingsSelectorComponent implements Component {
 
 	#formatTextInputValue(path: SettingPath, value: unknown): string {
 		if (path === "providers.maxInFlightRequests") return this.#formatProviderLimitsValue(value);
+		if (this.#isSecretSetting(path)) return String(value ?? "").trim() ? "(configured)" : "";
 		return this.#formatTextInputEditValue(path, value);
 	}
 
-	#formatTextInputEditValue(_path: SettingPath, value: unknown): string {
+	#formatTextInputEditValue(path: SettingPath, value: unknown): string {
+		if (this.#isSecretSetting(path)) return "";
 		if (value === undefined || value === null) return "";
 		if (typeof value === "object") return JSON.stringify(value);
 		return String(value);

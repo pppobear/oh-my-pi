@@ -63,6 +63,14 @@ interface OpenVikingLegacyConfigFile {
 	};
 }
 
+interface OpenVikingConnectionProfile {
+	baseUrl: string;
+	apiKey?: string;
+	accountId?: string;
+	userId?: string;
+	peerId?: string;
+}
+
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
 const DEFAULT_OV_CONF_PATH = "~/.openviking/ov.conf";
 const DEFAULT_OVCLI_CONF_PATH = "~/.openviking/ovcli.conf";
@@ -92,17 +100,17 @@ function boolFromUnknown(value: unknown): boolean | undefined {
 	return undefined;
 }
 
-function boolFromEnv(value: string | undefined): boolean | undefined {
-	return boolFromUnknown(value);
-}
-
-function numberFromUnknown(value: unknown, fallback: number): number {
+function finiteNumberFromUnknown(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) return value;
 	if (typeof value === "string" && value.trim()) {
 		const parsed = Number(value);
 		if (Number.isFinite(parsed)) return parsed;
 	}
-	return fallback;
+	return undefined;
+}
+
+function numberFromUnknown(value: unknown, fallback: number): number {
+	return finiteNumberFromUnknown(value) ?? fallback;
 }
 
 function intAtLeast(value: unknown, fallback: number, min: number): number {
@@ -123,6 +131,83 @@ function configuredStringSetting(settings: Settings, path: SettingPath): string 
 
 function resolveConfigValue<T>(ompValue: T | undefined, officialValue: T | undefined): T | undefined {
 	return ompValue ?? officialValue;
+}
+
+type OpenVikingEnvironmentValue = string | boolean | number;
+
+interface OpenVikingEnvironmentSetting {
+	names: readonly string[];
+	parse(value: string | undefined): OpenVikingEnvironmentValue | undefined;
+}
+
+const OPENVIKING_ENVIRONMENT_SETTINGS: Partial<Record<SettingPath, OpenVikingEnvironmentSetting>> = {
+	"openviking.apiUrl": { names: ["OPENVIKING_URL", "OPENVIKING_BASE_URL"], parse: asString },
+	"openviking.apiKey": { names: ["OPENVIKING_BEARER_TOKEN", "OPENVIKING_API_KEY"], parse: asString },
+	"openviking.account": { names: ["OPENVIKING_ACCOUNT"], parse: asString },
+	"openviking.user": { names: ["OPENVIKING_USER"], parse: asString },
+	"openviking.peerId": { names: ["OPENVIKING_PEER_ID"], parse: asString },
+	"openviking.autoRecall": { names: ["OPENVIKING_AUTO_RECALL"], parse: boolFromUnknown },
+	"openviking.autoRetain": { names: ["OPENVIKING_AUTO_CAPTURE"], parse: boolFromUnknown },
+	"openviking.recallLimit": { names: ["OPENVIKING_RECALL_LIMIT"], parse: finiteNumberFromUnknown },
+	"openviking.scoreThreshold": { names: ["OPENVIKING_SCORE_THRESHOLD"], parse: finiteNumberFromUnknown },
+	"openviking.minQueryLength": { names: ["OPENVIKING_MIN_QUERY_LENGTH"], parse: finiteNumberFromUnknown },
+	"openviking.recallMaxContentChars": {
+		names: ["OPENVIKING_RECALL_MAX_CONTENT_CHARS"],
+		parse: finiteNumberFromUnknown,
+	},
+	"openviking.recallTokenBudget": {
+		names: ["OPENVIKING_RECALL_TOKEN_BUDGET"],
+		parse: finiteNumberFromUnknown,
+	},
+	"openviking.recallPreferAbstract": {
+		names: ["OPENVIKING_RECALL_PREFER_ABSTRACT"],
+		parse: boolFromUnknown,
+	},
+	"openviking.captureAssistantTurns": {
+		names: ["OPENVIKING_CAPTURE_ASSISTANT_TURNS"],
+		parse: boolFromUnknown,
+	},
+	"openviking.timeoutMs": { names: ["OPENVIKING_TIMEOUT_MS"], parse: finiteNumberFromUnknown },
+	"openviking.captureTimeoutMs": {
+		names: ["OPENVIKING_CAPTURE_TIMEOUT_MS"],
+		parse: finiteNumberFromUnknown,
+	},
+	"openviking.debug": { names: ["OPENVIKING_DEBUG"], parse: boolFromUnknown },
+};
+
+function resolveOpenVikingEnvironmentSetting(
+	path: SettingPath,
+	env: NodeJS.ProcessEnv,
+): { name: string; value: OpenVikingEnvironmentValue } | undefined {
+	const setting = OPENVIKING_ENVIRONMENT_SETTINGS[path];
+	if (!setting) return undefined;
+	for (const name of setting.names) {
+		const value = setting.parse(env[name]);
+		if (value !== undefined) return { name, value };
+	}
+	return undefined;
+}
+
+export function getOpenVikingEnvironmentVariable(
+	path: SettingPath,
+	env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+	return resolveOpenVikingEnvironmentSetting(path, env)?.name;
+}
+
+function openVikingEnvironmentString(path: SettingPath, env: NodeJS.ProcessEnv): string | undefined {
+	const value = resolveOpenVikingEnvironmentSetting(path, env)?.value;
+	return typeof value === "string" ? value : undefined;
+}
+
+function openVikingEnvironmentBoolean(path: SettingPath, env: NodeJS.ProcessEnv): boolean | undefined {
+	const value = resolveOpenVikingEnvironmentSetting(path, env)?.value;
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function openVikingEnvironmentNumber(path: SettingPath, env: NodeJS.ProcessEnv): number | undefined {
+	const value = resolveOpenVikingEnvironmentSetting(path, env)?.value;
+	return typeof value === "number" ? value : undefined;
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T | null> {
@@ -155,21 +240,46 @@ export async function loadOpenVikingConfig(
 	]);
 	const server = legacy?.server;
 	const cc = legacy?.claude_code;
-	const officialBaseUrl = asString(cli?.url) ?? (server ? baseUrlFromLegacyServer(server) : undefined);
-	const baseUrl = (
-		envString(env, "OPENVIKING_URL", "OPENVIKING_BASE_URL") ??
-		resolveConfigValue(configuredStringSetting(settings, "openviking.apiUrl"), officialBaseUrl) ??
-		DEFAULT_BASE_URL
-	).replace(/\/+$/, "");
+	const cliBaseUrl = asString(cli?.url)?.replace(/\/+$/, "");
+	const cliProfile: OpenVikingConnectionProfile | null = cliBaseUrl
+		? {
+				baseUrl: cliBaseUrl,
+				apiKey: asString(cli?.api_key),
+				accountId: asString(cli?.account),
+				userId: asString(cli?.user),
+			}
+		: null;
+	const legacyProfile: OpenVikingConnectionProfile | null = legacy
+		? {
+				baseUrl: server ? baseUrlFromLegacyServer(server) : DEFAULT_BASE_URL,
+				apiKey: asString(cc?.apiKey) ?? asString(server?.root_api_key),
+				accountId: asString(cc?.accountId),
+				userId: asString(cc?.userId),
+				peerId: asString(cc?.peerId) ?? asString(cc?.peer_id),
+			}
+		: null;
+	const explicitBaseUrl =
+		openVikingEnvironmentString("openviking.apiUrl", env) ?? configuredStringSetting(settings, "openviking.apiUrl");
+	// Treat discovered connection details as an atomic profile. In particular,
+	// never pair an ovcli URL with ov.conf's server root key. An explicit OMP or
+	// environment credential remains a deliberate override for any URL. Keep a
+	// discovered profile only when an explicit URL names that exact same server;
+	// this makes a no-op Settings edit preserve the matching profile credential
+	// without ever carrying it to a different origin.
+	const normalizedExplicitBaseUrl = explicitBaseUrl?.replace(/\/+$/, "");
+	const officialProfile = cliProfile ?? legacyProfile;
+	const discoveredProfile =
+		normalizedExplicitBaseUrl && officialProfile?.baseUrl !== normalizedExplicitBaseUrl ? null : officialProfile;
+	const baseUrl = normalizedExplicitBaseUrl ?? discoveredProfile?.baseUrl ?? DEFAULT_BASE_URL;
 
 	const timeoutMs = intAtLeast(
-		env.OPENVIKING_TIMEOUT_MS ??
+		openVikingEnvironmentNumber("openviking.timeoutMs", env) ??
 			resolveConfigValue(configuredSetting(settings, "openviking.timeoutMs"), cc?.timeoutMs),
 		15_000,
 		1_000,
 	);
 	const captureTimeoutMs = intAtLeast(
-		env.OPENVIKING_CAPTURE_TIMEOUT_MS ??
+		openVikingEnvironmentNumber("openviking.captureTimeoutMs", env) ??
 			resolveConfigValue(configuredSetting(settings, "openviking.captureTimeoutMs"), cc?.captureTimeoutMs),
 		Math.max(timeoutMs * 2, 30_000),
 		1_000,
@@ -178,64 +288,56 @@ export async function loadOpenVikingConfig(
 	return {
 		baseUrl,
 		apiKey:
-			envString(env, "OPENVIKING_BEARER_TOKEN", "OPENVIKING_API_KEY") ??
-			resolveConfigValue(
-				configuredStringSetting(settings, "openviking.apiKey"),
-				asString(cli?.api_key) ?? asString(cc?.apiKey) ?? asString(server?.root_api_key),
-			) ??
+			openVikingEnvironmentString("openviking.apiKey", env) ??
+			configuredStringSetting(settings, "openviking.apiKey") ??
+			discoveredProfile?.apiKey ??
 			null,
 		accountId:
-			envString(env, "OPENVIKING_ACCOUNT") ??
-			resolveConfigValue(
-				configuredStringSetting(settings, "openviking.account"),
-				asString(cli?.account) ?? asString(cc?.accountId),
-			) ??
+			openVikingEnvironmentString("openviking.account", env) ??
+			configuredStringSetting(settings, "openviking.account") ??
+			discoveredProfile?.accountId ??
 			null,
 		userId:
-			envString(env, "OPENVIKING_USER") ??
-			resolveConfigValue(
-				configuredStringSetting(settings, "openviking.user"),
-				asString(cli?.user) ?? asString(cc?.userId),
-			) ??
+			openVikingEnvironmentString("openviking.user", env) ??
+			configuredStringSetting(settings, "openviking.user") ??
+			discoveredProfile?.userId ??
 			null,
 		peerId:
-			envString(env, "OPENVIKING_PEER_ID") ??
-			resolveConfigValue(
-				configuredStringSetting(settings, "openviking.peerId"),
-				asString(cc?.peerId) ?? asString(cc?.peer_id),
-			) ??
+			openVikingEnvironmentString("openviking.peerId", env) ??
+			configuredStringSetting(settings, "openviking.peerId") ??
+			discoveredProfile?.peerId ??
 			null,
 		timeoutMs,
 		captureTimeoutMs,
 		autoRecall:
-			boolFromEnv(env.OPENVIKING_AUTO_RECALL) ??
+			openVikingEnvironmentBoolean("openviking.autoRecall", env) ??
 			resolveConfigValue(configuredSetting(settings, "openviking.autoRecall"), boolFromUnknown(cc?.autoRecall)) ??
 			true,
 		autoRetain:
-			boolFromEnv(env.OPENVIKING_AUTO_CAPTURE) ??
+			openVikingEnvironmentBoolean("openviking.autoRetain", env) ??
 			resolveConfigValue(configuredSetting(settings, "openviking.autoRetain"), boolFromUnknown(cc?.autoCapture)) ??
 			true,
 		recallLimit: intAtLeast(
-			env.OPENVIKING_RECALL_LIMIT ??
+			openVikingEnvironmentNumber("openviking.recallLimit", env) ??
 				resolveConfigValue(configuredSetting(settings, "openviking.recallLimit"), cc?.recallLimit),
 			6,
 			1,
 		),
 		scoreThreshold: clamped(
-			env.OPENVIKING_SCORE_THRESHOLD ??
+			openVikingEnvironmentNumber("openviking.scoreThreshold", env) ??
 				resolveConfigValue(configuredSetting(settings, "openviking.scoreThreshold"), cc?.scoreThreshold),
 			0.35,
 			0,
 			1,
 		),
 		minQueryLength: intAtLeast(
-			env.OPENVIKING_MIN_QUERY_LENGTH ??
+			openVikingEnvironmentNumber("openviking.minQueryLength", env) ??
 				resolveConfigValue(configuredSetting(settings, "openviking.minQueryLength"), cc?.minQueryLength),
 			3,
 			1,
 		),
 		recallMaxContentChars: intAtLeast(
-			env.OPENVIKING_RECALL_MAX_CONTENT_CHARS ??
+			openVikingEnvironmentNumber("openviking.recallMaxContentChars", env) ??
 				resolveConfigValue(
 					configuredSetting(settings, "openviking.recallMaxContentChars"),
 					cc?.recallMaxContentChars,
@@ -244,13 +346,13 @@ export async function loadOpenVikingConfig(
 			50,
 		),
 		recallTokenBudget: intAtLeast(
-			env.OPENVIKING_RECALL_TOKEN_BUDGET ??
+			openVikingEnvironmentNumber("openviking.recallTokenBudget", env) ??
 				resolveConfigValue(configuredSetting(settings, "openviking.recallTokenBudget"), cc?.recallTokenBudget),
 			2_000,
 			200,
 		),
 		recallPreferAbstract:
-			boolFromEnv(env.OPENVIKING_RECALL_PREFER_ABSTRACT) ??
+			openVikingEnvironmentBoolean("openviking.recallPreferAbstract", env) ??
 			resolveConfigValue(
 				configuredSetting(settings, "openviking.recallPreferAbstract"),
 				boolFromUnknown(cc?.recallPreferAbstract),
@@ -262,7 +364,7 @@ export async function loadOpenVikingConfig(
 			1,
 		),
 		captureAssistantTurns:
-			boolFromEnv(env.OPENVIKING_CAPTURE_ASSISTANT_TURNS) ??
+			openVikingEnvironmentBoolean("openviking.captureAssistantTurns", env) ??
 			resolveConfigValue(
 				configuredSetting(settings, "openviking.captureAssistantTurns"),
 				boolFromUnknown(cc?.captureAssistantTurns),
@@ -274,7 +376,7 @@ export async function loadOpenVikingConfig(
 			1,
 		),
 		debug:
-			boolFromEnv(env.OPENVIKING_DEBUG) ??
+			openVikingEnvironmentBoolean("openviking.debug", env) ??
 			resolveConfigValue(configuredSetting(settings, "openviking.debug"), boolFromUnknown(cc?.debug)) ??
 			false,
 	};

@@ -56,6 +56,13 @@
 ### Added
 
 - Added `FuzzyText`, a prepared fuzzy-match handle that builds the search index once and matches many queries against it, optimizing performance for large corpora like session or transcript searches.
+- Added `SettingItem.displayValue` for rendering an effective setting value while keeping `currentValue` as the value used for editing and cycling.
+
+### Fixed
+
+- Sanitized settings-list display values and search text so ANSI escapes, control characters, line breaks, and tabs cannot corrupt terminal rows.
+- Sanitized values assigned programmatically to single-line inputs while preserving token boundaries across line breaks.
+- Added `FuzzyText`, a prepared fuzzy-match handle that builds the search index once and matches many queries against it — for callers whose corpus exceeds the internal index cache's admission size (e.g. session/transcript search).
 
 ### Fixed
 

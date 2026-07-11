@@ -205,6 +205,8 @@ interface UiNumber extends UiBase {
 }
 
 interface UiString extends UiBase {
+	/** Treat this value as sensitive: mask it in lists and never prefill editors. */
+	secret?: boolean;
 	/**
 	 * Submenu options.
 	 *  - Array  → submenu with these choices.
@@ -217,6 +219,7 @@ interface UiString extends UiBase {
 /** Wide ui shape exposed to consumers that walk the schema generically. */
 export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
+	secret?: boolean;
 };
 
 interface BooleanDef {
@@ -228,6 +231,8 @@ interface BooleanDef {
 interface StringDef {
 	type: "string";
 	default: string | undefined;
+	/** Sensitive value: never expose it through settings UI or CLI output. */
+	secret?: boolean;
 	ui?: UiString;
 }
 
@@ -363,7 +368,7 @@ export const SETTINGS_SCHEMA = {
 	// Env (`OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN`) takes precedence so
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
-	"auth.broker.token": { type: "string", default: undefined },
+	"auth.broker.token": { type: "string", default: undefined, secret: true },
 
 	autoResume: {
 		type: "boolean",
@@ -2645,6 +2650,7 @@ export const SETTINGS_SCHEMA = {
 	"mnemopi.embeddingApiKey": {
 		type: "string",
 		default: undefined,
+		secret: true,
 		ui: {
 			tab: "memory",
 			group: "Mnemopi",
@@ -2689,6 +2695,7 @@ export const SETTINGS_SCHEMA = {
 	"mnemopi.llmApiKey": {
 		type: "string",
 		default: undefined,
+		secret: true,
 		ui: {
 			tab: "memory",
 			group: "Mnemopi",
@@ -2730,6 +2737,7 @@ export const SETTINGS_SCHEMA = {
 	"openviking.apiKey": {
 		type: "string",
 		default: undefined,
+		secret: true,
 		ui: {
 			tab: "memory",
 			group: "OpenViking",
@@ -2994,7 +3002,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"hindsight.apiToken": { type: "string", default: undefined },
+	"hindsight.apiToken": { type: "string", default: undefined, secret: true },
 
 	"hindsight.bankId": {
 		type: "string",
@@ -5209,6 +5217,7 @@ export const SETTINGS_SCHEMA = {
 	"searxng.token": {
 		type: "string",
 		default: undefined,
+		secret: true,
 	},
 
 	"searxng.basicUsername": {
@@ -5219,6 +5228,7 @@ export const SETTINGS_SCHEMA = {
 	"searxng.basicPassword": {
 		type: "string",
 		default: undefined,
+		secret: true,
 	},
 
 	"searxng.categories": {
@@ -5268,6 +5278,7 @@ export const SETTINGS_SCHEMA = {
 	"dev.autoqaPush.token": {
 		type: "string",
 		default: undefined,
+		secret: true,
 	},
 
 	/**
@@ -5355,7 +5366,15 @@ export function hasUi(path: SettingPath): boolean {
 /** Get UI metadata for a path (undefined if no UI) */
 export function getUi(path: SettingPath): AnyUiMetadata | undefined {
 	const def = SETTINGS_SCHEMA[path];
-	return "ui" in def ? (def.ui as AnyUiMetadata) : undefined;
+	if (!("ui" in def)) return undefined;
+	const ui = def.ui as AnyUiMetadata;
+	return isSecretSetting(path) && ui.secret !== true ? { ...ui, secret: true } : ui;
+}
+
+/** Whether a setting value must never be rendered or emitted verbatim. */
+export function isSecretSetting(path: SettingPath): boolean {
+	const def = SETTINGS_SCHEMA[path] as { secret?: unknown };
+	return def.secret === true;
 }
 
 /** Get all paths for a specific tab */

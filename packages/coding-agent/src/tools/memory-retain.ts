@@ -72,14 +72,41 @@ export class MemoryRetainTool implements AgentTool<typeof memoryRetainSchema> {
 			if (!primary) {
 				throw new Error("OpenViking backend is not initialised for this session.");
 			}
-			let stored = 0;
-			for (const item of params.items) {
-				if (await primary.save(item.content, item.context)) stored += 1;
+			const outcome = await primary.saveMany(params.items);
+			if (outcome.status === "failed") {
+				throw new Error(outcome.error);
 			}
-			const noun = stored === 1 ? "memory" : "memories";
+			if (outcome.status === "reconciling") {
+				return { content: [{ type: "text", text: outcome.message }], details: { count: 0 } };
+			}
+			if (outcome.status === "completed") {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								outcome.extracted === 0
+									? "0 memories stored; OpenViking completed extraction without creating a durable memory."
+									: "OpenViking completed extraction, but did not report a durable-memory count.",
+						},
+					],
+					details: { count: 0 },
+				};
+			}
+			const count = outcome.status === "stored" ? outcome.extracted : params.items.length;
+			const noun = count === 1 ? "memory" : "memories";
+			const inputNoun = count === 1 ? "memory input" : "memory inputs";
+			const text =
+				outcome.status === "stored"
+					? `${count} ${noun} stored.`
+					: outcome.reason === "timeout"
+						? `${count} ${noun} queued for extraction.`
+						: outcome.reason === "aborted"
+							? `${count} ${inputNoun} archived; extraction status check interrupted.`
+							: `${count} ${inputNoun} archived; extraction status unavailable.`;
 			return {
-				content: [{ type: "text", text: `${stored} ${noun} stored.` }],
-				details: { count: stored },
+				content: [{ type: "text", text }],
+				details: outcome.status === "queued" && outcome.reason === "timeout" ? { count, queued: true } : { count },
 			};
 		}
 

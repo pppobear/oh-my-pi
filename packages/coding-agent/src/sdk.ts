@@ -94,7 +94,7 @@ import {
 	parseMCPToolName,
 } from "./mcp";
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
-import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
+import { createSessionMemoryRuntimeContext, type MemoryBackend, resolveMemoryBackend } from "./memory-backend";
 import type { MnemopiSessionState } from "./mnemopi/state";
 import type { OpenVikingSessionState } from "./openviking/state";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
@@ -177,7 +177,7 @@ import {
 	WriteTool,
 	warmupLspServers,
 } from "./tools";
-import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
+import { isMCPToolName, MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
@@ -2308,9 +2308,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// session-start build — so a subagent that filtered them out, a mid-session
 			// enable that never built them, or a same-named custom tool while auto-learn
 			// is off all get no guidance.
+			const hasBuiltInTool = (name: string): boolean =>
+				hasSession ? session.hasBuiltInTool(name) : builtInToolNames.includes(name);
 			const autoLearnInstructions = buildAutoLearnInstructions({
-				manageSkill: builtInToolNames.includes("manage_skill"),
-				learn: builtInToolNames.includes("learn"),
+				manageSkill: hasBuiltInTool("manage_skill"),
+				learn: hasBuiltInTool("learn"),
 			});
 			const appendParts: string[] = [];
 			if (memoryInstructions) appendParts.push(memoryInstructions);
@@ -2406,6 +2408,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// same-named custom/extension tool is never force-activated when auto-learn is
 		// off) to keep guidance, controller, and the active set consistent.
 		if (explicitlyRequestedToolNames) {
+			for (const name of MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES) {
+				if (builtInToolNames.includes(name) && !explicitlyRequestedToolNames.includes(name)) {
+					explicitlyRequestedToolNames.push(name);
+				}
+			}
 			for (const name of ["manage_skill", "learn"]) {
 				if (builtInToolNames.includes(name) && !explicitlyRequestedToolNames.includes(name)) {
 					explicitlyRequestedToolNames.push(name);
@@ -2908,40 +2915,117 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 
-		const startMemoryBackend = async () => {
-			const memoryBackend = await resolveMemoryBackend(settings);
-			await memoryBackend.start({
+		let appliedMemoryBackend: MemoryBackend | undefined;
+		const liveParentSession = () =>
+			options.parentAgentId ? (agentRegistry.get(options.parentAgentId)?.session ?? undefined) : undefined;
+		const memoryStartOptions = () => {
+			const parentSession = liveParentSession();
+			return {
 				session,
 				settings,
 				modelRegistry,
 				agentDir,
 				taskDepth,
-				parentHindsightSessionState: options.parentHindsightSessionState,
-				parentMnemopiSessionState: options.parentMnemopiSessionState,
-				parentOpenVikingSessionState: options.parentOpenVikingSessionState,
-			});
+				parentHindsightSessionState: parentSession
+					? parentSession.getHindsightSessionState()
+					: options.parentHindsightSessionState,
+				parentMnemopiSessionState: parentSession
+					? parentSession.getMnemopiSessionState()
+					: options.parentMnemopiSessionState,
+				parentOpenVikingSessionState: parentSession
+					? parentSession.getOpenVikingSessionState()
+					: options.parentOpenVikingSessionState,
+			};
 		};
+		const startMemoryBackend = async () => {
+			const memoryBackend = await resolveMemoryBackend(settings);
+			await memoryBackend.start(memoryStartOptions());
+			appliedMemoryBackend = memoryBackend;
+		};
+		const createMemoryRuntimeTools = async (): Promise<AgentTool[]> => {
+			const tools = await Promise.all(
+				MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES.map(name =>
+					logger.time(`createTools:${name}:memoryReconcile`, BUILTIN_TOOLS[name], toolSession),
+				),
+			);
+			return tools.filter((tool): tool is Tool => tool !== null);
+		};
+		const refreshMemoryBackendRuntime = async (memoryBackend: MemoryBackend): Promise<boolean> => {
+			const openVikingUnavailable = memoryBackend.id === "openviking" && !session.getOpenVikingSessionState();
+			const memoryTools = openVikingUnavailable ? [] : await createMemoryRuntimeTools();
+			await session.refreshMemoryTools(memoryTools, {
+				forceActive:
+					memoryBackend.id === "openviking" && !openVikingUnavailable ? ["recall", "retain", "reflect"] : [],
+			});
+			// A connection-only change can leave tool signatures byte-identical while
+			// changing memory instructions and the state they describe.
+			await session.refreshBaseSystemPrompt();
+			return !openVikingUnavailable;
+		};
+		let initialMemoryStartupPromise: Promise<void> = Promise.resolve();
+		session.setMemoryBackendReconciler({
+			depth: taskDepth,
+			parentSession: liveParentSession,
+			relatedSessions: () => {
+				const sessions = new Set([session]);
+				for (const ref of agentRegistry.list()) {
+					if (ref.session?.settings === settings) sessions.add(ref.session);
+				}
+				return [...sessions];
+			},
+			stop: async () => {
+				await initialMemoryStartupPromise;
+				const previousBackend = appliedMemoryBackend;
+				appliedMemoryBackend = undefined;
+				await previousBackend?.stop?.({ session });
+			},
+			start: async ({ parentReconciled }) => {
+				if (!parentReconciled) await liveParentSession()?.waitForMemoryBackendReconcile();
+				if (session.isDisposed) return;
+
+				const nextBackend = await resolveMemoryBackend(settings);
+				await nextBackend.start(memoryStartOptions());
+				appliedMemoryBackend = nextBackend;
+				if (session.isDisposed) {
+					await nextBackend.stop?.({ session });
+					appliedMemoryBackend = undefined;
+					return;
+				}
+				if (!(await refreshMemoryBackendRuntime(nextBackend))) {
+					throw new Error("OpenViking backend failed to start with the current configuration.");
+				}
+			},
+		});
 
 		// Auto-learn can immediately trigger a synthetic capture turn after the
 		// first real stop. When a memory backend is selected, install that backend's
 		// per-session state first so the capture turn's `learn` tool observes the
-		// same initialized state as normal memory tools. Other sessions keep memory
-		// startup in the background to preserve the existing startup profile.
+		// same initialized state as normal memory tools. OpenViking also needs to be
+		// ready before returning the session: its first-turn recall hook cannot
+		// recover a recall skipped while the remote session is still being ensured.
+		// Other sessions keep memory startup in the background to preserve the
+		// existing startup profile.
 		//
-		// Gated on `autolearn.enabled` to match the tools: `createTools` builds the
-		// `learn`/`manage_skill` registry ONCE at session start and no settings
-		// change rebuilds it, so installing the controller while disabled would let a
-		// mid-session enable fire a nudge pointing at tools the session never built.
-		// Activation is therefore a session-start decision for BOTH the controller
-		// and the tools; the fire-time re-check in `#onAgentEnd` still handles a
-		// mid-session DISABLE. The subscription lives for the session's lifetime; the
-		// reference is intentionally discarded (the listener retains it).
-		if (settings.get("autolearn.enabled") && taskDepth === 0) {
-			await logger.time("startMemoryStartupTask", startMemoryBackend);
-			new AutoLearnController({ session, settings });
+		// Gated on `autolearn.enabled`: the controller and `manage_skill` tool are
+		// session-start decisions. Memory backend reconciliation may add or remove
+		// `learn`, but enabling auto-learn mid-session still cannot create the missing
+		// controller. The fire-time re-check handles a mid-session disable. The
+		// subscription lives for the session's lifetime; the reference is discarded.
+		const autoLearnEnabled = settings.get("autolearn.enabled") && taskDepth === 0;
+		const requiresReadyMemoryBackend = settings.get("memory.backend") === "openviking" || autoLearnEnabled;
+		initialMemoryStartupPromise = logger.time("startMemoryStartupTask", startMemoryBackend);
+		if (requiresReadyMemoryBackend) {
+			await initialMemoryStartupPromise;
 		} else {
-			void logger.time("startMemoryStartupTask", startMemoryBackend);
+			void initialMemoryStartupPromise;
 		}
+		if (appliedMemoryBackend?.id === "openviking") {
+			// The initial system prompt is built before per-session OpenViking state
+			// exists. Reconcile it once startup settles; a failed connection remains a
+			// usable inert session without advertising tools that cannot execute.
+			await refreshMemoryBackendRuntime(appliedMemoryBackend);
+		}
+		if (autoLearnEnabled) new AutoLearnController({ session, settings });
 
 		// Wire MCP manager callbacks to session for reactive tool updates.
 		// Skip when reusing a parent's manager — the parent owns the callbacks.

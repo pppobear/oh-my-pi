@@ -9,6 +9,7 @@ import type {
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { openVikingBackend } from "@oh-my-pi/pi-coding-agent/openviking/backend";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -44,6 +45,7 @@ interface FakeAcpBuiltinSession {
 	exportToHtml(outputPath?: string): Promise<string>;
 	getTodoPhases(): Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
+	waitForMemoryBackendReconcile(): Promise<void>;
 	refreshBaseSystemPrompt(): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
@@ -139,6 +141,7 @@ function createRuntime() {
 		setTodoPhases(phases) {
 			this._todoPhases = phases;
 		},
+		async waitForMemoryBackendReconcile() {},
 		async refreshBaseSystemPrompt() {},
 		getAsyncJobSnapshot: () => null,
 		formatSessionAsText: () => "",
@@ -777,6 +780,32 @@ describe("wave 3 commands", () => {
 		const result = await executeAcpBuiltinSlashCommand("/memory unknownverb", runtime);
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("Usage: /memory");
+	});
+
+	it("/memory clear: reports that OpenViking cannot safely bulk-delete remote memory", async () => {
+		const { output, runtime, session } = createRuntime();
+		runtime.settings.set("memory.backend", "openviking");
+		const refreshBaseSystemPrompt = spyOn(session, "refreshBaseSystemPrompt");
+
+		const result = await executeAcpBuiltinSlashCommand("/memory clear", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output).toHaveLength(1);
+		expect(output[0]).toContain("Memory clear failed: OpenViking memory is server-side");
+		expect(output[0]).not.toContain("Memory cleared.");
+		expect(refreshBaseSystemPrompt).not.toHaveBeenCalled();
+	});
+
+	it("/memory enqueue: reports OpenViking capture failures instead of success", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.settings.set("memory.backend", "openviking");
+		const enqueue = spyOn(openVikingBackend, "enqueue").mockRejectedValue(new Error("capture failed"));
+
+		const result = await executeAcpBuiltinSlashCommand("/memory enqueue", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output).toEqual(["Memory enqueue failed: capture failed"]);
+		expect(enqueue).toHaveBeenCalledTimes(1);
 	});
 
 	// /todo start fuzzy match

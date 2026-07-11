@@ -36,8 +36,10 @@ The agent can read memory files directly using `memory://` URLs with the `read` 
 | `view`                | Show the current backend injection payload                |
 | `stats`               | Show backend-specific memory statistics, when supported   |
 | `diagnose`            | Show backend-specific diagnostics, when supported         |
-| `clear` / `reset`     | Delete active backend memory data/artifacts               |
+| `clear` / `reset`     | Clear backend-owned data where supported                   |
 | `enqueue` / `rebuild` | Force consolidation/retention work for the active backend |
+
+OpenViking memories live on the server and must be deleted by specific resource URI. Consequently, `/memory clear` and `/memory reset` fail for that backend without detaching the active OpenViking session state.
 
 ## How it works
 

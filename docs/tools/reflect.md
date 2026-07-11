@@ -35,22 +35,26 @@ Mnemopi:
 - `details = {}`
 - The local path performs recall plus formatting; it does not call a separate synthesis endpoint.
 
+OpenViking:
+- Searches the active remote scope and returns `Based on recalled OpenViking memories:` followed by bounded context with `memory://` ids.
+
 ## Flow
-1. `MemoryReflectTool.createIf(...)` exposes the tool when `memory.backend` is either `"hindsight"` or `"mnemopi"`.
+1. `MemoryReflectTool.createIf(...)` exposes the tool when `memory.backend` is `"hindsight"`, `"mnemopi"`, or `"openviking"`.
 2. `execute(...)` runs under `untilAborted(...)`.
 3. If the backend is `mnemopi`:
    - it reads `session.getMnemopiSessionState()` and throws if the backend was not started;
    - if `context` has non-whitespace content, it recalls with `<query>\n\nAdditional context:\n<context>`; otherwise it recalls with `query`;
    - it calls `state.recallResultsScoped(...)` using the same local scoping and merge behavior as `recall`;
    - if results exist, it renders them through `state.formatContextScoped(...)` and prefixes `Based on recalled memories:`.
-4. If the backend is `hindsight`:
+4. If the backend is `openviking`, it appends optional context to the query, searches the active parent state, and formats matching resources with ids.
+5. If the backend is `hindsight`:
    - it reads `session.getHindsightSessionState()` and throws if the backend was not started;
    - it calls `ensureBankExists(...)` with the current `bankId`, config, and the session state's `banksSet`;
    - `ensureBankExists(...)` best-effort `PUT`s `/v1/default/banks/{bank_id}` (`createBank`) with optional `reflect_mission` / `retain_mission` once per bank per session state; failures are swallowed;
    - it calls `state.client.reflect(...)` with `query`, optional `context`, configured recall budget, and bank-scope tag filters;
    - `HindsightApi.reflect(...)` POSTs `/v1/default/banks/{bank_id}/reflect` and defaults its own budget to `"low"` when callers omit one; this tool always passes the configured budget;
    - blank or whitespace-only responses are replaced with `No relevant information found to reflect on.`
-5. Backend failures are logged with `logger.warn("reflect failed", ...)` and rethrown as `Error` instances when needed.
+6. Backend failures are logged with `logger.warn("reflect failed", ...)` and rethrown as `Error` instances when needed.
 
 ## Modes / Variants
 - Hindsight tool path: one remote reflect request, optionally focused by `context`.
@@ -75,7 +79,7 @@ Mnemopi:
   - Aborts through `untilAborted(...)` if the tool call signal is cancelled.
 
 ## Limits & Caps
-- Tool availability requires `memory.backend` to be `"hindsight"` or `"mnemopi"`; default `memory.backend` is `"off"`.
+- Tool availability requires `memory.backend` to be `"hindsight"`, `"mnemopi"`, or `"openviking"`; default `memory.backend` is `"off"`.
 - Tool-level params: only `query` is required; `context` is optional.
 - Hindsight budget setting comes from `hindsight.recallBudget`, default `"mid"`.
 - Hindsight `reflect` has no client-side token cap parameter here; unlike `recall`, the tool does not pass `maxTokens`.
@@ -85,6 +89,7 @@ Mnemopi:
 ## Errors
 - Throws `Mnemopi backend is not initialised for this session.` when `memory.backend == "mnemopi"` but no state exists.
 - Throws `Hindsight backend is not initialised for this session.` when `memory.backend == "hindsight"` but no state exists.
+- Throws `OpenViking backend is not initialised for this session.` when `memory.backend == "openviking"` but no state exists.
 - Hindsight HTTP and fetch failures become `HindsightError` with `statusCode` and parsed `details` when available.
 - Hindsight `ensureBankExists(...)` failures are silent to the tool caller; only the later reflect request can fail visibly.
 - Mnemopi recall target failures inside `collectScopedRecallResults(...)` are caught per bank and logged only when `mnemopi.debug` is enabled; if all targets fail, the tool can return the no-information text.

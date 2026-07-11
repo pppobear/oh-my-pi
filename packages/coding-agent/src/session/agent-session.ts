@@ -311,7 +311,7 @@ import { formatTitleConversationContext, type TitleConversationTurn } from "../t
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import { assertEditableFile } from "../tools/auto-generated-guard";
 import { releaseTabsForOwner } from "../tools/browser/tab-supervisor";
-import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
+import { isMCPToolName, MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
 import { outputMeta, wrapToolWithMetaNotice } from "../tools/output-meta";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
@@ -652,6 +652,14 @@ export interface AgentSessionDisposeOptions {
 	 * (`/quit`, test teardown, subagent completion).
 	 */
 	reason?: postmortem.Reason;
+}
+
+export interface MemoryBackendReconciler {
+	depth: number;
+	parentSession(): AgentSession | undefined;
+	relatedSessions(): readonly AgentSession[];
+	stop(): Promise<void>;
+	start(options: { parentReconciled: boolean }): Promise<void>;
 }
 
 type CompactionCheckResult = Readonly<{
@@ -1936,6 +1944,8 @@ export class AgentSession {
 	 * the dominant cause of prompt-cache invalidation in long sessions.
 	 */
 	#lastAppliedToolSignature: string | undefined;
+	/** Only the newest async prompt rebuild may publish its result. */
+	#promptRebuildGeneration = 0;
 	/**
 	 * Model identifier (`provider/id`) currently rendered into `#baseSystemPrompt`.
 	 * The prompt surfaces the active model to the agent, so a model switch must
@@ -1944,6 +1954,7 @@ export class AgentSession {
 	 */
 	#promptModelKey: string | undefined;
 	#builtInToolNames = new Set<string>();
+	#installedMemoryBuiltinToolNames = new Set<string>();
 	#rpcHostToolNames = new Set<string>();
 	/** Session-owned `xd://` device registry (built-ins + dynamic mounts); `undefined` when the transport is off. */
 	#xdevRegistry: XdevRegistry | undefined;
@@ -2518,6 +2529,9 @@ export class AgentSession {
 		this.#toolRegistry = config.toolRegistry ?? new Map();
 		this.#createVibeTools = config.createVibeTools;
 		this.#builtInToolNames = new Set(config.builtInToolNames ?? []);
+		this.#installedMemoryBuiltinToolNames = new Set(
+			MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES.filter(name => this.#builtInToolNames.has(name)),
+		);
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#transformProviderContext = config.transformProviderContext;
@@ -3506,6 +3520,78 @@ export class AgentSession {
 
 	setSessionSwitchReconciler(reconciler: (() => Promise<void>) | null): void {
 		this.#sessionSwitchReconciler = reconciler ?? undefined;
+	}
+
+	#memoryBackendReconciler: MemoryBackendReconciler | undefined;
+	#memoryBackendReconcileQueue: Promise<void> = Promise.resolve();
+
+	setMemoryBackendReconciler(reconciler: MemoryBackendReconciler | null): void {
+		this.#memoryBackendReconciler = reconciler ?? undefined;
+	}
+
+	/**
+	 * Reconcile every live session that shares this backend configuration. Stops
+	 * run child-first so aliases release shared resources before their primary;
+	 * starts run parent-first so aliases always bind to the replacement primary.
+	 */
+	static reconcileMemoryBackends(sessions: Iterable<AgentSession>): Promise<void> {
+		const participants = [...new Set(sessions)]
+			.map(session => ({ session, reconciler: session.#memoryBackendReconciler }))
+			.filter(
+				(entry): entry is { session: AgentSession; reconciler: MemoryBackendReconciler } =>
+					!entry.session.#isDisposed && entry.reconciler !== undefined,
+			);
+		if (participants.length === 0) return Promise.resolve();
+
+		const participantSessions = new Set(participants.map(entry => entry.session));
+		const depths = [...new Set(participants.map(entry => entry.reconciler.depth))].sort((a, b) => a - b);
+		const previous = Promise.all(participants.map(entry => entry.session.#memoryBackendReconcileQueue));
+		const result = previous.then(async () => {
+			const errors: unknown[] = [];
+			const stopped = new Set<AgentSession>();
+
+			for (const depth of depths.toReversed()) {
+				const group = participants.filter(entry => entry.reconciler.depth === depth);
+				const results = await Promise.allSettled(group.map(entry => entry.reconciler.stop()));
+				for (let index = 0; index < results.length; index++) {
+					const outcome = results[index];
+					if (outcome.status === "fulfilled") stopped.add(group[index].session);
+					else errors.push(outcome.reason);
+				}
+			}
+
+			for (const depth of depths) {
+				const group = participants.filter(entry => entry.reconciler.depth === depth && stopped.has(entry.session));
+				const results = await Promise.allSettled(
+					group.map(entry => {
+						const parent = entry.reconciler.parentSession();
+						return entry.reconciler.start({
+							parentReconciled: parent === undefined || participantSessions.has(parent),
+						});
+					}),
+				);
+				for (const outcome of results) {
+					if (outcome.status === "rejected") errors.push(outcome.reason);
+				}
+			}
+
+			if (errors.length > 0) throw errors[0];
+		});
+		const settled = result.catch(() => {});
+		for (const { session } of participants) session.#memoryBackendReconcileQueue = settled;
+		return result;
+	}
+
+	/** Queue a coordinated backend stop/start and tool/prompt refresh. */
+	reconcileMemoryBackend(): Promise<void> {
+		const reconciler = this.#memoryBackendReconciler;
+		if (!reconciler || this.#isDisposed) return Promise.resolve();
+		return AgentSession.reconcileMemoryBackends([this, ...reconciler.relatedSessions()]);
+	}
+
+	/** Wait until the latest reconcile settles; UI callers receive its error separately. */
+	waitForMemoryBackendReconcile(): Promise<void> {
+		return this.#memoryBackendReconcileQueue;
 	}
 
 	/** Provider-scoped mutable state store for transport/session caches. */
@@ -6148,11 +6234,27 @@ export class AgentSession {
 		this.getMnemopiSessionState()?.setSessionId(sid);
 	}
 
-	#rekeyOpenVikingMemoryForCurrentSessionId(): void {
+	async #flushOpenVikingMemoryForSessionTransition(): Promise<boolean> {
+		const state = this.getOpenVikingSessionState();
+		if (!state) return true;
+		try {
+			const flushed = await state.flushAndCommit();
+			// The cursor custom entry is appended by flushAndCommit. Make it durable
+			// even on a partial remote failure, and before any operation replaces the
+			// active SessionManager state.
+			await this.sessionManager.flush();
+			return flushed;
+		} catch (error) {
+			logger.warn("OpenViking: session transition flush failed", { error: String(error) });
+			return false;
+		}
+	}
+
+	async #rekeyOpenVikingMemoryForCurrentSessionId(baselineExistingTranscript = false): Promise<void> {
 		if (this.settings.get("memory.backend") !== "openviking") return;
 		const sid = this.agent.sessionId;
 		if (!sid) return;
-		this.getOpenVikingSessionState()?.setSessionId(sid);
+		await this.getOpenVikingSessionState()?.rekeySession(sid, { baselineExistingTranscript });
 	}
 
 	/** New session file: reset auto-recall / retain-threshold counters for the new transcript. */
@@ -6242,6 +6344,8 @@ export class AgentSession {
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
+		this.#memoryBackendReconciler = undefined;
+		await this.#memoryBackendReconcileQueue;
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
@@ -6319,6 +6423,9 @@ export class AgentSession {
 		// Clean up an empty session created by this session's /move so it doesn't accumulate.
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			logger.warn("OpenViking: final session tail could not be flushed during dispose");
+		}
 		await this.sessionManager.close();
 		// beginDispose() stopped the advisor and captured its recorder close; await
 		// it so the final advisor turn is flushed before the process may exit.
@@ -6359,7 +6466,7 @@ export class AgentSession {
 		const mnemopiState = setMnemopiSessionState(this, undefined);
 		await mnemopiState?.dispose({ timeoutMs: options.mnemopiConsolidateTimeoutMs });
 		const openVikingState = setOpenVikingSessionState(this, undefined);
-		openVikingState?.dispose();
+		await openVikingState?.dispose({ flush: false });
 		// Tear down the embeddings subprocess AFTER mnemopi state.dispose:
 		// consolidate-on-dispose may still call `embed()` to store the final
 		// memories, and that round-trips through the worker we are about to
@@ -6402,7 +6509,6 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
-		this.#rekeyOpenVikingMemoryForCurrentSessionId();
 		this.agent.appendOnlyContext?.invalidateForModelChange();
 		return {
 			previousSessionId,
@@ -6580,6 +6686,39 @@ export class AgentSession {
 		}
 
 		await this.#applyActiveToolsByName([...new Set([...baseToolNames, ...vibeToolNames])]);
+	}
+
+	/** Replace only session-owned, backend-dependent built-ins. */
+	async refreshMemoryTools(memoryTools: AgentTool[], options: { forceActive?: Iterable<string> } = {}): Promise<void> {
+		const previousInstalled = new Set(this.#installedMemoryBuiltinToolNames);
+		const nextActive = this.getActiveToolNames().filter(name => !previousInstalled.has(name));
+
+		for (const name of previousInstalled) {
+			if (this.#builtInToolNames.has(name)) this.#toolRegistry.delete(name);
+			this.#builtInToolNames.delete(name);
+			this.#selectedDiscoveredToolNames.delete(name);
+		}
+		this.#installedMemoryBuiltinToolNames.clear();
+
+		const installed: AgentTool[] = [];
+		for (const tool of memoryTools) {
+			// A custom or extension tool with the same name intentionally wins.
+			if (this.#toolRegistry.has(tool.name)) continue;
+			const wrapped = this.#wrapRuntimeTool(tool);
+			this.#toolRegistry.set(wrapped.name, wrapped);
+			this.#builtInToolNames.add(wrapped.name);
+			this.#installedMemoryBuiltinToolNames.add(wrapped.name);
+			installed.push(wrapped);
+		}
+
+		const forceActive = new Set(options.forceActive ?? []);
+		const discoveryMode = this.#resolveEffectiveDiscoveryMode();
+		for (const tool of installed) {
+			if (forceActive.has(tool.name) || discoveryMode !== "all" || tool.loadMode !== "discoverable") {
+				nextActive.push(tool.name);
+			}
+		}
+		await this.#applyActiveToolsByName([...new Set(nextActive)]);
 	}
 
 	/** Removes tools installed by {@link activateVibeTools} and activates `nextToolNames`. */
@@ -6781,12 +6920,15 @@ export class AgentSession {
 				if (this.#lastAppliedToolSignature !== undefined) {
 					this.#clearInheritedProviderPromptCacheKey();
 				}
+				const generation = ++this.#promptRebuildGeneration;
 				const built = await this.#rebuildSystemPrompt(validToolNames, this.#toolRegistry);
-				this.#baseSystemPrompt = built.systemPrompt;
-				this.#baseSystemPromptBeforeMemoryPromotion = undefined;
-				this.agent.setSystemPrompt(this.#baseSystemPrompt);
-				this.#lastAppliedToolSignature = signature;
-				this.#promptModelKey = this.#currentPromptModelKey();
+				if (generation === this.#promptRebuildGeneration) {
+					this.#baseSystemPrompt = built.systemPrompt;
+					this.#baseSystemPromptBeforeMemoryPromotion = undefined;
+					this.agent.setSystemPrompt(this.#baseSystemPrompt);
+					this.#lastAppliedToolSignature = signature;
+					this.#promptModelKey = this.#currentPromptModelKey();
+				}
 			}
 		}
 	}
@@ -6807,7 +6949,9 @@ export class AgentSession {
 		const activeToolNames = this.getActiveToolNames();
 		this.#setActiveToolNames?.(activeToolNames);
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
+		const generation = ++this.#promptRebuildGeneration;
 		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
+		if (generation !== this.#promptRebuildGeneration) return;
 		this.#baseSystemPrompt = built.systemPrompt;
 		this.#baseSystemPromptBeforeMemoryPromotion = undefined;
 		if (
@@ -6828,13 +6972,12 @@ export class AgentSession {
 	}
 
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
+		await this.waitForMemoryBackendReconcile();
 		const backend = await resolveMemoryBackend(this.settings);
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
 
 		try {
 			const injected = await backend.beforeAgentStartPrompt(this, promptText);
-			if (!injected) return this.#baseSystemPrompt;
-
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			try {
 				await this.refreshBaseSystemPrompt();
@@ -6843,6 +6986,18 @@ export class AgentSession {
 					backend: backend.id,
 					error: String(refreshErr),
 				});
+			}
+			if (!injected) {
+				if (
+					this.#baseSystemPromptBeforeMemoryPromotion !== undefined &&
+					this.#baseSystemPrompt.length === previousBaseSystemPrompt.length &&
+					this.#baseSystemPrompt.every((part, index) => part === previousBaseSystemPrompt[index])
+				) {
+					this.#baseSystemPrompt = this.#baseSystemPromptBeforeMemoryPromotion;
+					this.#baseSystemPromptBeforeMemoryPromotion = undefined;
+					this.agent.setSystemPrompt(this.#baseSystemPrompt);
+				}
+				return this.#baseSystemPrompt;
 			}
 
 			if (
@@ -9061,10 +9216,15 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.waitForMemoryBackendReconcile();
 
 		this.#disconnectFromAgent();
 		await this.abort();
 		this.#cancelOwnAsyncJobs();
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			this.#reconnectToAgent();
+			return false;
+		}
 		this.#closeAllProviderSessions("new session");
 		this.agent.reset();
 		if (options?.drop && previousSessionFile) {
@@ -9095,7 +9255,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
-		this.#rekeyOpenVikingMemoryForCurrentSessionId();
+		await this.#rekeyOpenVikingMemoryForCurrentSessionId(true);
 		await this.#resetMemoryContextForNewTranscript();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -9152,9 +9312,11 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.waitForMemoryBackendReconcile();
 
 		// Flush current session to ensure all entries are written
 		await this.sessionManager.flush();
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) return false;
 
 		// Fork the session (creates new session file with same entries)
 		const forkResult = await this.sessionManager.fork();
@@ -9187,7 +9349,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
-		this.#rekeyOpenVikingMemoryForCurrentSessionId();
+		await this.#rekeyOpenVikingMemoryForCurrentSessionId(true);
 		await this.#resetMemoryContextForNewTranscript();
 
 		// Emit session_switch event with reason "fork" to hooks
@@ -10537,7 +10699,9 @@ export class AgentSession {
 					return undefined;
 				}
 			}
+			await this.waitForMemoryBackendReconcile();
 			await this.sessionManager.flush();
+			if (!(await this.#flushOpenVikingMemoryForSessionTransition())) return undefined;
 			this.#cancelOwnAsyncJobs();
 			await this.sessionManager.newSession(previousSessionFile ? { parentSession: previousSessionFile } : undefined);
 
@@ -10557,7 +10721,7 @@ export class AgentSession {
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
-			this.#rekeyOpenVikingMemoryForCurrentSessionId();
+			await this.#rekeyOpenVikingMemoryForCurrentSessionId(true);
 			await this.#resetMemoryContextForNewTranscript();
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -15348,12 +15512,17 @@ export class AgentSession {
 				return false;
 			}
 		}
+		await this.waitForMemoryBackendReconcile();
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
 
 		// Flush pending writes before switching so restore snapshots reflect committed state.
 		await this.sessionManager.flush();
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			this.#reconnectToAgent();
+			return false;
+		}
 		const previousSessionState = this.sessionManager.captureState();
 		// Only same-session reloads compare against the prior context to detect
 		// rollback edits (`#didSessionMessagesChange` below). Building it for a
@@ -15407,7 +15576,7 @@ export class AgentSession {
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
-			this.#rekeyOpenVikingMemoryForCurrentSessionId();
+			await this.#rekeyOpenVikingMemoryForCurrentSessionId();
 
 			let sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
@@ -15540,7 +15709,7 @@ export class AgentSession {
 			this.#syncAgentSessionId(previousSessionState.sessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#rekeyMnemopiMemoryForCurrentSessionId();
-			this.#rekeyOpenVikingMemoryForCurrentSessionId();
+			await this.#rekeyOpenVikingMemoryForCurrentSessionId();
 			this.agent.setTools(previousTools);
 			this.#baseSystemPrompt = previousBaseSystemPrompt;
 			this.#baseSystemPromptBeforeMemoryPromotion = previousBaseSystemPromptBeforeMemoryPromotion;
@@ -15605,13 +15774,17 @@ export class AgentSession {
 			}
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
-
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
+		await this.waitForMemoryBackendReconcile();
 
 		// Flush pending writes before branching
 		await this.sessionManager.flush();
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			throw new Error("Cannot branch because the OpenViking session tail could not be flushed");
+		}
+
+		// Clear pending messages only after the old session is durably captured.
+		this.#pendingNextTurnMessages = [];
+		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#cancelOwnAsyncJobs();
 
 		if (!selectedEntry.parentId) {
@@ -15626,7 +15799,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
-		this.#rekeyOpenVikingMemoryForCurrentSessionId();
+		await this.#rekeyOpenVikingMemoryForCurrentSessionId(true);
 		await this.#resetMemoryContextForNewTranscript();
 
 		// Reload messages from entries (works for both file and in-memory mode)
@@ -15683,6 +15856,7 @@ export class AgentSession {
 				return { cancelled: true, sessionFile: previousSessionFile };
 			}
 		}
+		await this.waitForMemoryBackendReconcile();
 
 		await this.#cancelPostPromptTasks();
 		if (
@@ -15694,6 +15868,10 @@ export class AgentSession {
 		) {
 			throw new Error("Cannot branch /btw while session maintenance or user work is still running");
 		}
+		await this.sessionManager.flush();
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			throw new Error("Cannot branch /btw because the OpenViking session tail could not be flushed");
+		}
 
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -15702,7 +15880,6 @@ export class AgentSession {
 			await this.abort({ goalReason: "internal", reason: "branching /btw" });
 			this.agent.replaceQueues([], []);
 		}
-		await this.sessionManager.flush();
 		this.#cancelOwnAsyncJobs();
 
 		this.sessionManager.createBranchedSession(leafId);
@@ -15719,7 +15896,7 @@ export class AgentSession {
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
 		this.#rekeyMnemopiMemoryForCurrentSessionId();
-		this.#rekeyOpenVikingMemoryForCurrentSessionId();
+		await this.#rekeyOpenVikingMemoryForCurrentSessionId(true);
 		await this.#resetMemoryContextForNewTranscript();
 
 		const sessionContext = this.buildDisplaySessionContext();
@@ -15817,6 +15994,7 @@ export class AgentSession {
 				fromExtension = true;
 			}
 		}
+		await this.waitForMemoryBackendReconcile();
 
 		// Run default summarizer if needed
 		let summaryText: string | undefined;
@@ -15887,6 +16065,10 @@ export class AgentSession {
 			newLeafId = targetId;
 		}
 
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			throw new Error("Cannot navigate because the OpenViking session tail could not be flushed");
+		}
+
 		// Switch leaf (with or without summary)
 		// Summary is attached at the navigation target position (newLeafId), not the old branch
 		let summaryEntry: BranchSummaryEntry | undefined;
@@ -15902,6 +16084,8 @@ export class AgentSession {
 			// No summary, navigating to non-root
 			this.sessionManager.branch(newLeafId);
 		}
+		await this.#rekeyOpenVikingMemoryForCurrentSessionId(true);
+		await this.#resetMemoryContextForNewTranscript();
 
 		// Update agent state — build display context to populate agent messages.
 		const stateContext = this.sessionManager.buildSessionContext();
