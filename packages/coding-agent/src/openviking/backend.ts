@@ -5,6 +5,7 @@ import type { MemoryBackend, MemoryBackendSaveInput, MemoryBackendStartOptions }
 import { OpenVikingApi } from "./client";
 import { loadOpenVikingConfig } from "./config";
 import { getOpenVikingSessionState, OpenVikingSessionState, setOpenVikingSessionState } from "./state";
+import { memoryUriFromOpenVikingUri } from "./uri";
 
 const STATIC_INSTRUCTIONS = [
 	"OpenViking memory is active.",
@@ -71,7 +72,7 @@ export const openVikingBackend: MemoryBackend = {
 		previous?.dispose();
 		logger.warn(
 			"OpenViking memory is server-side; only the local OpenViking session cache was cleared. " +
-				"Delete viking://user memory resources from OpenViking to wipe upstream state.",
+				"Delete the corresponding user memory resources from OpenViking to wipe upstream state.",
 		);
 	},
 
@@ -144,13 +145,16 @@ export const openVikingBackend: MemoryBackend = {
 		if (options?.signal?.aborted) {
 			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
 		}
-		const items = results.map(item => ({
-			id: item.uri,
-			content: (item.abstract || item.overview || item.uri).trim(),
-			score: item.score,
-			source: item._sourceType,
-			metadata: { uri: item.uri, category: item.category, level: item.level },
-		}));
+		const items = results.map(item => {
+			const uri = memoryUriFromOpenVikingUri(item.uri);
+			return {
+				id: uri,
+				content: (item.abstract || item.overview || uri).trim(),
+				score: item.score,
+				source: item._sourceType,
+				metadata: { uri, category: item.category, level: item.level },
+			};
+		});
 		return { backend: "openviking" as const, query, count: items.length, items };
 	},
 

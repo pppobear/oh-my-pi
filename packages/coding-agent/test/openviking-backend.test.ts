@@ -170,6 +170,67 @@ describe("OpenViking memory backend", () => {
 		expect(client.search).toHaveBeenCalled();
 	});
 
+	it("exposes recalled OpenViking documents through memory URLs", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: { ...baseConfig, recallTokenBudget: 0 },
+			client: {} as OpenVikingApi,
+			session: session as never,
+		});
+
+		const formatted = await state.formatItems(
+			[
+				{
+					uri: "viking://user/default/memories/preferences/editor.md",
+					score: 0.9,
+					_sourceType: "memory",
+				},
+			],
+			true,
+		);
+
+		expect(formatted).toContain("memory://user/default/memories/preferences/editor.md");
+		expect(formatted).not.toContain("viking://");
+	});
+
+	it("returns memory URLs from backend searches", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const client = {
+			search: vi.fn(async () => [
+				{
+					uri: "viking://user/default/memories/preferences/editor.md",
+					abstract: "Editor preference",
+					_sourceType: "memory",
+				},
+			]),
+		} as unknown as OpenVikingApi;
+		setOpenVikingSessionState(
+			session as never,
+			new OpenVikingSessionState({
+				sessionId: "session-1",
+				config: baseConfig,
+				client,
+				session: session as never,
+			}),
+		);
+
+		const result = await openVikingBackend.search?.(
+			{ agentDir: "/tmp/agent", cwd: "/tmp/project", session: session as never },
+			"editor",
+		);
+
+		expect(result?.items).toEqual([
+			expect.objectContaining({
+				id: "memory://user/default/memories/preferences/editor.md",
+				content: "Editor preference",
+				metadata: expect.objectContaining({ uri: "memory://user/default/memories/preferences/editor.md" }),
+			}),
+		]);
+	});
+
 	it("uses the child session transcript for subagent OpenViking recall", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		const parentSession = makeFakeSession(settings, [{ role: "user", content: "parent-only transcript" }]);

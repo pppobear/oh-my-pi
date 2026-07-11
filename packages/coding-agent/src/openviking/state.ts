@@ -5,11 +5,12 @@ import { extractMessages } from "../hindsight/transcript";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { OpenVikingApi, OpenVikingSearchItem } from "./client";
 import type { OpenVikingConfig } from "./config";
+import { memoryUriFromOpenVikingUri } from "./uri";
 
 const kOpenVikingSessionState = Symbol("openviking.sessionState");
 const OPENVIKING_SESSION_PREFIX = "omp-";
 const OPENVIKING_CONTEXT_HEADER =
-	"Relevant context from OpenViking. Use recall or read MCP tools to expand viking:// URIs.";
+	"Relevant context from OpenViking. Use recall or read MCP tools to expand memory:// URIs.";
 
 type CapturedRole = "user" | "assistant";
 
@@ -211,13 +212,14 @@ export class OpenVikingSessionState {
 			const score =
 				typeof item.score === "number" ? ` ${(Math.max(0, Math.min(1, item.score)) * 100).toFixed(0)}%` : "";
 			const source = item._sourceType ?? "memory";
-			const uriLine = `- [${source}${score}] ${item.uri}${includeIds ? ` (id: ${item.uri})` : ""}`;
+			const memoryUri = memoryUriFromOpenVikingUri(item.uri);
+			const uriLine = `- [${source}${score}] ${memoryUri}${includeIds ? ` (id: ${memoryUri})` : ""}`;
 			if (budgetRemaining <= 0) {
 				lines.push(uriLine);
 				continue;
 			}
 			const content = await this.resolveItemContent(item);
-			const contentLine = `- [${source}${score}] ${content}${includeIds ? ` (id: ${item.uri})` : ""}`;
+			const contentLine = `- [${source}${score}] ${content}${includeIds ? ` (id: ${memoryUri})` : ""}`;
 			const lineTokens = estimateTokens(contentLine);
 			if (lineTokens > budgetRemaining && lines.length > 2) {
 				lines.push(uriLine);
@@ -236,9 +238,9 @@ export class OpenVikingSessionState {
 		if (this.config.recallPreferAbstract && summary) {
 			content = summary;
 		} else if (item.level === 2 || item.uri.endsWith(".md")) {
-			content = (await this.client.readContent(item.uri))?.trim() || summary || item.uri;
+			content = (await this.client.readContent(item.uri))?.trim() || summary || memoryUriFromOpenVikingUri(item.uri);
 		} else {
-			content = summary || item.uri;
+			content = summary || memoryUriFromOpenVikingUri(item.uri);
 		}
 		if (content.length > this.config.recallMaxContentChars) {
 			return `${content.slice(0, this.config.recallMaxContentChars)}...`;

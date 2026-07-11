@@ -294,6 +294,10 @@
 - Fixed native Windows binary compatibility on older Windows 10 CPUs by building the `omp-windows-x64.exe` release asset with a baseline x64 runtime instead of AVX2. (#5172)
 - Fixed `GenerateImage` rejecting OpenAI Codex-compatible proxy bearer keys when the token does not expose a `chatgpt-account-id`. (#5174)
 - Fixed context promotion documentation to accurately reflect the `contextPromotionTarget` runtime behavior and `contextPromotion.enabled` default. (#5163)
+### Added
+
+- Added `memory.backend: openviking` for OpenViking-backed recall/retain, first-turn prompt injection, session capture, `/memory` status/search/save, and subagent memory aliasing.
+- Added OpenViking document reads through existing `memory://` internal URLs when the OpenViking backend is active.
 
 ## [16.4.3] - 2026-07-11
 
@@ -1146,10 +1150,6 @@
 - Fixed MCP OAuth authorization failing with `Authorization failed: An unexpected error occurred` against authorization servers (Plane is the live example) that reject redundant fallback `resource` indicators. OMP now drops same-origin resources only when it synthesized them from the server URL fallback (e.g. `https://mcp.plane.so/http/mcp`). Provider-advertised resources from OAuth/protected-resource discovery or an embedded authorization-URL `resource` query parameter are preserved even when they are same-origin or origin-only, so gateway-hosted MCP services can still request the audience they advertised. The refresh-token path uses the same policy, filtered against the authorization-server origin persisted on the credential as `authorizationUrl`, with `tokenUrl`'s origin as the legacy fallback when that field is absent. ([#3502](https://github.com/can1357/oh-my-pi/issues/3502))
 
 ## [16.1.20] - 2026-06-25
-### Added
-
-- Added `memory.backend: openviking` for OpenViking-backed recall/retain, first-turn prompt injection, session capture, `/memory` status/search/save, and subagent memory aliasing.
-- Added `viking://` internal URL reads so OpenViking recall results can be expanded through the read tool.
 
 ### Fixed
 

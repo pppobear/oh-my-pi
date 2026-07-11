@@ -43,7 +43,6 @@ const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	skill: true,
 	ssh: true,
 	vault: true,
-	viking: true,
 };
 // Schemes whose resource URIs are server-defined and may legitimately end
 // with selector-shaped tails (e.g. `:raw`, `:conflicts`, `:1-50`, `/:raw`).

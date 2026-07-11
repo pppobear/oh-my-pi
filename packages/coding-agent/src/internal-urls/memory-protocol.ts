@@ -1,8 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { isSettingsInitialized, Settings } from "../config/settings";
 import { getMemoryRoot } from "../memories";
 import { getMnemopiSessionState, type MnemopiScopedMemoryHit, type MnemopiSessionState } from "../mnemopi/state";
+import { OpenVikingApi } from "../openviking/client";
+import { loadOpenVikingConfig } from "../openviking/config";
+import { openVikingUriFromMemoryUrl } from "../openviking/uri";
 import { AgentRegistry } from "../registry/agent-registry";
 import { buildDirectoryResource } from "./filesystem-resource";
 import { validateRelativePath } from "./skill-protocol";
@@ -10,6 +14,35 @@ import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, Ur
 
 const DEFAULT_MEMORY_FILE = "memory_summary.md";
 const MEMORY_NAMESPACE = "root";
+
+function settingsFromContext(context?: ResolveContext): Settings | undefined {
+	if (context?.settings instanceof Settings) return context.settings;
+	return isSettingsInitialized() ? Settings.instance : undefined;
+}
+
+function contentTypeForUri(uri: string): InternalResource["contentType"] {
+	const pathname = uri.split(/[?#]/, 1)[0]?.toLowerCase() ?? "";
+	if (pathname.endsWith(".md")) return "text/markdown";
+	if (pathname.endsWith(".json")) return "application/json";
+	return "text/plain";
+}
+
+async function resolveOpenVikingMemory(url: InternalUrl, settings: Settings): Promise<InternalResource> {
+	const config = await loadOpenVikingConfig(settings);
+	const client = new OpenVikingApi(config);
+	const uri = openVikingUriFromMemoryUrl(url);
+	const content = await client.readContent(uri);
+	if (content === null) {
+		throw new Error(`OpenViking content not found or unavailable: ${url.href}`);
+	}
+	return {
+		url: url.href,
+		content,
+		contentType: contentTypeForUri(uri),
+		size: Buffer.byteLength(content, "utf-8"),
+		notes: ["OpenViking content"],
+	};
+}
 
 /**
  * Snapshot of memory roots for every registered session, deduped.
@@ -203,7 +236,8 @@ function renderMnemopiMemory(url: InternalUrl, hit: MnemopiScopedMemoryHit): Int
  * Protocol handler for memory:// URLs.
  * Resolves file-backed roots against the calling session cwd when provided.
  * Contextless callers fall back to the live-session registry for legacy
- * cross-session lookups.
+ * cross-session lookups. Non-root hosts route through OpenViking for callers
+ * using that backend, or resolve as Mnemopi memory ids for the SQLite bridge.
  */
 export class MemoryProtocolHandler implements ProtocolHandler {
 	readonly scheme = "memory";
@@ -213,6 +247,12 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 		const namespace = url.rawHost || url.hostname;
 		if (!namespace) {
 			throw new Error("memory:// URL requires a namespace: memory://root or memory://<memory-id>");
+		}
+		if (namespace !== MEMORY_NAMESPACE) {
+			const settings = settingsFromContext(context);
+			if (settings?.get("memory.backend") === "openviking") {
+				return await resolveOpenVikingMemory(url, settings);
+			}
 		}
 
 		// Mnemopi rows live in SQLite banks per session, keyed by memory id.
