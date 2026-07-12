@@ -247,6 +247,15 @@
 - Added model-keyed fallback management to the /models Roles view: model and `provider/*` chains render as a separate section below the roles (divider + "+ New fallback…" row for creating one by picking the protected model, then keying it by model or provider), with the same replace/remove/reorder editing as role chains; the model strip gains `fallbacks:<model>` and `fallbacks:<provider>/*` chips as shortcuts.
 - Added `/queue <message>` plus `->` / `=>` composer shorthand for follow-up messages that wait until the agent yields. The shorthand opens a dim `Queueing` header and splits sequential numeric, Roman-numeral, or alphabetic lists into separately highlighted queue entries.
 - Added per-model TPS/TTFT tracking: every completed assistant turn folds its timing into recency-weighted aggregates in `~/.omp/agent.db`, and the /models browser shows measured speed — a right-aligned `118t/s` column on wide terminals (plus TTFT, e.g. `0.9s 118t/s`, when wider) and `~118t/s · 0.9s ttft` facts in the selection detail line — with no dependency on the `omp stats` session scan.
+- Added `memory.backend: openviking` with per-turn recalled context, `recall`/`retain`/`reflect`/`learn` support, automatic session capture, `/memory` status/search/save, `memory://` resource reads, and shared parent/subagent memory state. Unsupported bulk clear/reset operations are reported without altering the active session.
+- Added collision-resistant workspace isolation for OpenViking, with explicit peer overrides, opt-in cross-project recall, an unscoped opt-out, and compatible actor-scoped recall across supported server versions.
+- Added resumable two-phase OpenViking capture and extraction: explicit writes distinguish stored, empty, queued, failed, and unavailable outcomes, while automatic capture tracks extraction in the background. Interactive OpenViking setting changes reconcile live across parent and subagent sessions, and credentials resolve from environment overrides or the matching CLI profile.
+- Added `auto` as a valid `thinking-level` in agent frontmatter; the bundled `task` subagent now defaults to it. An explicit `:level` suffix on a resolved model pattern takes precedence over an agent-definition default.
+- Added rich interactive ask dialogs: a fixed-height bottom panel (sized at spawn from the tallest tab, clamped to 70% of the terminal) with question tabs, option previews, notes, per-option markers, and ask.enabled gating. Multi-select questions toggle with Space/Enter and confirm from the Submit tab; submitting an empty Other value unselects the custom answer. ([#4186](https://github.com/can1357/oh-my-pi/issues/4186))
+- Added role un-assignment to the model hub: `x`/Backspace on a role row (or Enter on a chip already holding the model) clears the role back to auto-selection — previously only possible by editing config.
+- Added a manual F5 provider refresh in the model hub; providers now auto-refresh at most once per application lifetime instead of on every visit.
+- Added custom role creation to the Model Hub roles view (`+ New role…` / `n`): name the role and jump straight into assigning its model.
+- Added quick-switch (ctrl+p) cycle editing to the Model Hub roles view: `c` toggles a role's membership, `[`/`]` (or Shift+↑/↓) reorder it, with a live segment-track preview of the resulting cycle.
 
 ### Changed
 
@@ -296,6 +305,9 @@
 - Fixed compiled Linux binary extension loading failures related to bundled web-search header generation data paths.
 - Fixed job list and empty-poll snapshots returning empty output, ensuring running subagents without backing jobs are properly listed.
 - Fixed agents getting stuck waiting for messages from peers that have already stopped running.
+- Fixed memory-backend startup, live-reconciliation, and teardown races so disposed sessions cannot publish late state or block shutdown indefinitely.
+- Fixed effective and secret setting display in `/settings` and `omp config`; discovered or environment-provided values are reflected without exposing secret contents.
+- Fixed visible per-keystroke lag while searching in the `/resume` session picker. Literal matches now rank synchronously from a cached per-session haystack, fuzzy scoring runs in bounded background chunks that converge to the same ranking (large listings previously rebuilt a fuzzy index per token per session on every keystroke), and the prompt-history SQLite lookup — an FTS query plus a LIKE scan over every stored prompt — is debounced off the keystroke path.
 - Fixed compiled Linux binary extension loading when bundled web-search header generation cannot read `header-generator` data files from the build-time path. ([#5178](https://github.com/can1357/oh-my-pi/issues/5178))
 - Fixed plugin custom tool loading to skip and report invalid feature entries instead of crashing startup when a plugin dependency tree leaves one feature unresolved. ([#5189](https://github.com/can1357/oh-my-pi/issues/5189))
 

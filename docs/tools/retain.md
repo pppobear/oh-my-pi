@@ -45,14 +45,9 @@ Mnemopi:
 - The tool calls the local backend synchronously, but `rememberScoped(...)` catches per-item write failures and returns `undefined`; the tool still reports the requested count.
 
 OpenViking:
-- `content[0].text = "<count> memory stored."` or `"<count> memories stored."` when extraction completes within the bounded wait and creates durable memories. This count comes from the extraction task and can differ from the input item count.
-- A completed task that extracts zero durable memories reports `0 memories stored; OpenViking completed extraction without creating a durable memory.` instead of claiming the requested items were stored.
-- `content[0].text = "<count> memory queued for extraction."` or `"<count> memories queued for extraction."` when synchronous archival succeeds but the extraction task does not finish within that wait.
-- If archival succeeds but task status is unavailable or the status check is interrupted, the response says the memory inputs were archived and that extraction status is unavailable/interrupted; it does not call them queued or stored.
-- If neither the message write nor the follow-up archive can be acknowledged, the response says automatic reconciliation remains pending and warns against retrying the full batch yet.
-- Before Phase 1, the client persists the current commit-task IDs. If the commit response is lost, it adopts only one unambiguous new task; zero or multiple new tasks remain reconciling and the input is not sent again.
-- Task-delta recovery assumes one writer per OpenViking session. If no task appears, persisted `commit_count` advancement can confirm an untracked archive without claiming extraction. With neither a task nor Phase 1 evidence after the recovery window, the state remains blocked for manual OpenViking inspection because the current commit API has no idempotency key.
-- A failed extraction task is returned as a tool error; archival success alone is not reported as stored.
+- Completed extraction reports the server's durable-memory count, which may differ from the input count. Zero extraction is reported explicitly rather than claiming the inputs were stored.
+- Archived input is reported as queued when a known extraction task outlives the bounded wait. If task status is unavailable or interrupted, the response confirms only archival and names that status.
+- Definite archive or extraction failures return a tool error. Ambiguous acknowledgement remains pending reconciliation and warns against retrying the batch; it is never reported as stored.
 
 ## Flow
 1. `MemoryRetainTool.createIf(...)` exposes the tool when `memory.backend` is `"hindsight"`, `"mnemopi"`, or `"openviking"`.
@@ -62,10 +57,9 @@ OpenViking:
    - for each item, it calls `state.rememberScoped(item.content, ...)` with `source: "coding-agent-retain"`, `importance: 0.75`, `scope: "bank"`, `extract: true`, `extractEntities: true`, `veracity: "tool"`, `memoryType: "fact"`, and metadata `{ session_id, cwd, context, tool: "retain" }`;
    - writes go to the scoped retain bank selected by `packages/coding-agent/src/mnemopi/config.ts`.
 4. If the backend is `openviking`, the items are added to the active parent session and committed in two phases:
-   - before sending the commit, the state records a task-list baseline and the exact transcript boundary in its capture cursor;
-   - Phase 1 synchronously archives the new session messages and returns an extraction task id;
+   - Phase 1 synchronously archives the new session messages;
    - Phase 2 extracts durable memories asynchronously, and the explicit tool call polls that task for a bounded time;
-   - completion reports the server's extracted-memory count (including an explicit zero-memory outcome), a timeout reports the input items as queued for extraction, and task failure throws.
+   - persisted transcript and task state let later lifecycle activity resume unfinished work without resending acknowledged input.
 5. If the backend is `hindsight`:
    - it fetches `session.getHindsightSessionState()` and throws if the backend was not started;
    - each input item is handed to `HindsightSessionState.enqueueRetain(...)`;
@@ -101,7 +95,7 @@ OpenViking:
 - Session state
   - Hindsight: appends to the in-memory `HindsightRetainQueue`, includes `metadata.session_id`, and shares parent state for subagents.
   - Mnemopi: writes through the session's scoped `Mnemopi` instance, includes `session_id`, `cwd`, and optional `context`, and shares scoped resources with subagents.
-  - OpenViking: advances the archived transcript boundary after Phase 1 and persists both ambiguous commit-recovery baselines and unfinished extraction task ids so later lifecycle activity can resume monitoring them.
+  - OpenViking: advances the archived transcript boundary after Phase 1 and persists unfinished or ambiguously acknowledged work for later reconciliation.
 - User-visible prompts / interactive UI
   - Hindsight async flush failures emit `session.emitNotice("warning", ...)`; the model is not told.
   - Mnemopi write failures are logged by `rememberInScope(...)`; the tool response does not expose per-item failures.
@@ -131,7 +125,7 @@ OpenViking:
 - Throws `Mnemopi backend is not initialised for this session.` when `memory.backend == "mnemopi"` but no state exists.
 - Throws `Hindsight backend is not initialised for this session.` when `memory.backend == "hindsight"` but no state exists.
 - Throws `OpenViking backend is not initialised for this session.` when `memory.backend == "openviking"` but no state exists.
-- OpenViking definite Phase 1 request/protocol failures and Phase 2 extraction failures are surfaced as tool errors. An ambiguous Phase 1 response remains reconciling: the client will not repeat the commit or accept another explicit memory input until exactly one new task can be identified from its persisted baseline or persisted session metadata proves Phase 1 completed. A Phase 2 polling timeout is not an error because the server-side task remains queued. Missing, malformed, or interrupted task status is reported as unavailable rather than being mislabeled as queued.
+- OpenViking request, protocol, and extraction failures are surfaced as tool errors. Ambiguous archive acknowledgement remains pending reconciliation and prevents duplicate writes; bounded waits and unavailable task status use the non-error outputs described above.
 - Hindsight queue enqueue on disposed state throws `Hindsight retain queue is closed.`
 - Hindsight flush-time API failures are caught in `HindsightRetainQueue.#doFlush(...)`, logged, and converted into a warning notice instead of a tool error.
 - Hindsight bank/mission creation failures are swallowed in `ensureBankExists(...)`; writes continue.
@@ -140,8 +134,7 @@ OpenViking:
 ## Notes
 - Hindsight storage is server-side. `hindsightBackend.clear(...)` only clears local cache/state and warns that upstream deletion must happen in Hindsight UI or `deleteBank`.
 - Mnemopi storage is local SQLite. `mnemopiBackend.clear(...)` removes the scoped database files for the active configuration.
-- OpenViking commit acceptance means the session archive was written, not that durable-memory extraction finished. Even a completed Phase 2 may extract zero durable memories. Automatic capture accepts Phase 1 and tracks Phase 2 in the background; explicit `retain` calls wait only up to the configured bound.
-- `/memory clear` is unsupported for OpenViking: remote memories require resource-scoped deletion, so the backend preserves its active session state and rejects an unsafe bulk clear.
+- OpenViking bulk clear/reset is unsupported because remote memories require resource-scoped deletion; see [Autonomous Memory](../memory.md).
 - Hindsight auto-retain uses the same bank but a different path than this tool: `retainSession(...)` extracts plain user/assistant transcript, strips `<memories>` / `<mental_models>` blocks, and calls single-item `retain(...)`.
 - Mnemopi auto-retain stores prepared transcripts with `source: "coding-agent-transcript"`, `importance: 0.65`, `veracity: "unknown"`, and `memoryType: "episode"`.
 - Hindsight mental-model bootstrap lives in the shared backend: `HindsightSessionState.runMentalModelLoad(...)` optionally resolves seeds, creates missing models, then caches a rendered `<mental_models>` block for prompt injection.
