@@ -7,7 +7,7 @@ import { loadOpenVikingConfig } from "./config";
 import { getOpenVikingSessionState, OpenVikingSessionState, setOpenVikingSessionState } from "./state";
 import { memoryUriFromOpenVikingUri } from "./uri";
 
-const STATIC_INSTRUCTIONS = [
+export const OPENVIKING_DEVELOPER_INSTRUCTIONS = [
 	"OpenViking memory is active.",
 	"Use recall to search durable OpenViking memories before relying on guesses about user preferences or prior work.",
 	"Use retain to store durable facts, decisions, preferences, and reusable project knowledge.",
@@ -19,8 +19,8 @@ export const openVikingBackend: MemoryBackend = {
 
 	async start(options: MemoryBackendStartOptions): Promise<void> {
 		const { session, settings } = options;
-		const sessionId = session.sessionId;
-		if (!sessionId) return;
+		const transcriptId = session.sessionManager.getSessionId();
+		if (!transcriptId) return;
 
 		if (options.taskDepth > 0) {
 			const parent = options.parentOpenVikingSessionState?.aliasOf ?? options.parentOpenVikingSessionState;
@@ -28,7 +28,7 @@ export const openVikingBackend: MemoryBackend = {
 			const previous = setOpenVikingSessionState(
 				session,
 				new OpenVikingSessionState({
-					sessionId,
+					sessionId: transcriptId,
 					config: parent.config,
 					client: parent.client,
 					session,
@@ -44,11 +44,11 @@ export const openVikingBackend: MemoryBackend = {
 			const client = new OpenVikingApi(config);
 			const startingBranchIds = session.sessionManager.getBranch().map(entry => entry.id);
 			const transcriptStillCurrent = (): boolean => {
-				if (session.sessionId !== sessionId) return false;
+				if (session.sessionManager.getSessionId() !== transcriptId) return false;
 				const currentBranch = session.sessionManager.getBranch();
 				return startingBranchIds.every((id, index) => currentBranch[index]?.id === id);
 			};
-			const candidate = new OpenVikingSessionState({ sessionId, config, client, session });
+			const candidate = new OpenVikingSessionState({ sessionId: transcriptId, config, client, session });
 			const ensured = await client.ensureSession(candidate.sessionId);
 			if (!ensured.ok) throw new Error(ensured.error ?? `HTTP ${ensured.status ?? "unknown"}`);
 			// A session transition may have won while the remote ensure was in
@@ -73,7 +73,9 @@ export const openVikingBackend: MemoryBackend = {
 				return;
 			}
 			// Re-read the cursor after the previous state has durably advanced it.
-			const state = previous ? new OpenVikingSessionState({ sessionId, config, client, session }) : candidate;
+			const state = previous
+				? new OpenVikingSessionState({ sessionId: transcriptId, config, client, session })
+				: candidate;
 			setOpenVikingSessionState(session, state);
 			state.attachSessionListeners();
 		} catch (error) {
@@ -84,13 +86,14 @@ export const openVikingBackend: MemoryBackend = {
 	async stop({ session }): Promise<void> {
 		const state = getOpenVikingSessionState(session);
 		if (!state) return;
+		let sourceFlushed = false;
 		try {
-			if (!(await state.flushAndCommit())) {
+			sourceFlushed = await state.flushAndCommit();
+			if (!sourceFlushed) {
 				logger.warn("OpenViking: runtime switch left a resumable transcript tail", {
 					sessionId: state.sessionId,
 				});
 			}
-			await session.sessionManager.flush();
 		} catch (error) {
 			// Runtime settings changes do not replace the SessionManager transcript.
 			// Detaching is safe: the persisted capture cursor (or an at-least-once
@@ -101,9 +104,23 @@ export const openVikingBackend: MemoryBackend = {
 				error: String(error),
 			});
 		}
+		let transitionError: Error | undefined;
+		try {
+			const nextConfig = await loadOpenVikingConfig(session.settings);
+			if (!state.baselineWorkspaceTransition(nextConfig, sourceFlushed)) {
+				transitionError = new Error(
+					"OpenViking could not safely baseline the destination scope because the source transcript tail was not flushed.",
+				);
+			} else {
+				await session.sessionManager.flush();
+			}
+		} catch (error) {
+			transitionError = error instanceof Error ? error : new Error(String(error));
+		}
 		if (getOpenVikingSessionState(session) !== state) return;
 		setOpenVikingSessionState(session, undefined);
 		await state.dispose({ flush: false });
+		if (transitionError) throw transitionError;
 	},
 
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
@@ -111,7 +128,7 @@ export const openVikingBackend: MemoryBackend = {
 		const state = getOpenVikingSessionState(session);
 		if (!state?.isReady) return undefined;
 		const primary = state?.aliasOf ?? state;
-		const parts = [STATIC_INSTRUCTIONS];
+		const parts = [OPENVIKING_DEVELOPER_INSTRUCTIONS];
 		if (primary?.lastRecallSnippet) parts.push(primary.lastRecallSnippet);
 		return parts.join("\n\n");
 	},
@@ -147,7 +164,7 @@ export const openVikingBackend: MemoryBackend = {
 	}> {
 		const state = getOpenVikingSessionState(session);
 		const primary = state?.aliasOf ?? state;
-		if (!primary) {
+		if (!state?.isReady || !primary?.isReady) {
 			return {
 				backend: "openviking",
 				active: false,
@@ -181,7 +198,7 @@ export const openVikingBackend: MemoryBackend = {
 	async search({ session }, query, options) {
 		const state = getOpenVikingSessionState(session);
 		const primary = state?.aliasOf ?? state;
-		if (!primary) {
+		if (!state?.isReady || !primary) {
 			return {
 				backend: "openviking" as const,
 				query,
@@ -198,23 +215,53 @@ export const openVikingBackend: MemoryBackend = {
 		if (options?.signal?.aborted) {
 			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
 		}
-		const items = results.map(item => {
-			const uri = memoryUriFromOpenVikingUri(item.uri);
+		if (!primary.isReady) {
 			return {
-				id: uri,
-				content: (item.abstract || item.overview || uri).trim(),
-				score: item.score,
-				source: item._sourceType,
-				metadata: { uri, category: item.category, level: item.level },
+				backend: "openviking" as const,
+				query,
+				count: 0,
+				items: [],
+				message: "OpenViking workspace changed while search was running.",
 			};
-		});
+		}
+		const items = await Promise.all(
+			results.map(async item => {
+				const uri = memoryUriFromOpenVikingUri(item.uri);
+				return {
+					id: uri,
+					content: (await primary.resolveItemContent(item)).trim(),
+					score: item.score,
+					source: item._sourceType,
+					metadata: {
+						uri,
+						category: item.category,
+						level: item.level,
+						origin: item.origin,
+						rank: item.rank,
+						mode: item.mode,
+					},
+				};
+			}),
+		);
+		if (options?.signal?.aborted) {
+			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
+		}
+		if (!primary.isReady) {
+			return {
+				backend: "openviking" as const,
+				query,
+				count: 0,
+				items: [],
+				message: "OpenViking workspace changed while search was running.",
+			};
+		}
 		return { backend: "openviking" as const, query, count: items.length, items };
 	},
 
 	async save({ session }, input: MemoryBackendSaveInput) {
 		const state = getOpenVikingSessionState(session);
 		const primary = state?.aliasOf ?? state;
-		if (!primary) {
+		if (!state?.isReady || !primary) {
 			return {
 				backend: "openviking" as const,
 				stored: 0,
@@ -252,6 +299,7 @@ export const openVikingBackend: MemoryBackend = {
 	async preCompactionContext(messages: AgentMessage[], settings: Settings, session): Promise<string | undefined> {
 		if (settings.get("memory.backend") !== "openviking") return undefined;
 		const state = getOpenVikingSessionState(session);
+		if (!state?.isReady) return undefined;
 		const primary = state?.aliasOf ?? state;
 		return await primary?.recallForCompaction(messages);
 	},

@@ -133,6 +133,8 @@ describe("settings layout", () => {
 			"openviking.account",
 			"openviking.user",
 			"openviking.peerId",
+			"openviking.workspacePeer",
+			"openviking.recallPeerScope",
 			"openviking.autoRecall",
 			"openviking.autoRetain",
 			"openviking.recallLimit",

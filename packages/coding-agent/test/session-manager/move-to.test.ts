@@ -3,7 +3,10 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	SESSION_CWD_TRANSITION_CUSTOM_TYPE,
+	type SessionHeader,
+} from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { stripOuterDoubleQuotes } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
@@ -107,6 +110,15 @@ describe("SessionManager.moveTo", () => {
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 		expect(hasAssistantEntry(entries)).toBe(true);
+		const transition = entries.find(
+			entry => entry.type === "custom" && entry.customType === SESSION_CWD_TRANSITION_CUSTOM_TYPE,
+		);
+		if (transition?.type !== "custom") throw new Error("Expected persisted cwd transition");
+		expect(transition.data).toEqual({
+			version: 1,
+			fromCwd: path.resolve(cwdA),
+			toCwd: path.resolve(cwdB),
+		});
 	});
 
 	it("makes the moved session visible to resume from the target cwd", async () => {

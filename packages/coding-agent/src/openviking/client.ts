@@ -11,6 +11,11 @@ export interface OpenVikingSearchItem {
 	score?: number;
 	abstract?: string;
 	overview?: string;
+	summary?: string;
+	content?: string;
+	mode?: string;
+	origin?: string;
+	rank?: number;
 	category?: string;
 	level?: number;
 	_sourceType?: "memory" | "skill";
@@ -88,10 +93,16 @@ export interface OpenVikingMessagePayload {
 	peer_id?: string;
 }
 
-const SEARCH_SOURCES: readonly OpenVikingSearchSource[] = [
-	{ type: "memory", uri: "viking://user/memories", bucket: "memories" },
-	{ type: "skill", uri: "viking://user/skills", bucket: "skills" },
-];
+const MEMORY_SEARCH_SOURCE: OpenVikingSearchSource = {
+	type: "memory",
+	uri: "viking://user/memories",
+	bucket: "memories",
+};
+const SKILL_SEARCH_SOURCE: OpenVikingSearchSource = {
+	type: "skill",
+	uri: "viking://user/skills",
+	bucket: "skills",
+};
 
 export class OpenVikingApi {
 	readonly #config: OpenVikingConfig;
@@ -122,8 +133,15 @@ export class OpenVikingApi {
 	}
 
 	async search(query: string, limit: number = this.#config.recallLimit): Promise<OpenVikingSearchItem[]> {
-		const results = await Promise.all(SEARCH_SOURCES.map(source => this.#searchOneSource(query, source, limit)));
-		return dedupeAndRank(results.flat(), query).slice(0, limit);
+		const [recalledMemories, skills] = await Promise.all([
+			this.#recallMemories(query, limit),
+			this.#searchOneSource(query, SKILL_SEARCH_SOURCE, limit),
+		]);
+		if (recalledMemories) {
+			return mergeServerRankedRecall(recalledMemories, skills, query).slice(0, limit);
+		}
+		const legacyMemories = await this.#searchOneSource(query, MEMORY_SEARCH_SOURCE, Math.max(limit * 2, 8));
+		return dedupeAndRank([...legacyMemories, ...skills], query).slice(0, limit);
 	}
 
 	async readContent(uri: string): Promise<string | null> {
@@ -326,6 +344,37 @@ export class OpenVikingApi {
 			.filter(item => item.uri.length > 0);
 	}
 
+	async #recallMemories(query: string, limit: number): Promise<OpenVikingSearchItem[] | null> {
+		const body: Record<string, unknown> = {
+			query,
+			quotas: buildRecallQuotas(limit),
+			max_chars: Math.max(this.#config.recallMaxContentChars * limit, 1_000),
+			min_score: this.#config.scoreThreshold,
+			render: false,
+		};
+		if (this.#config.recallPeerScope === "actor") body.peer_scope = "actor";
+
+		let response = await this.#request<unknown>("/api/v1/search/recall", {
+			method: "POST",
+			body: JSON.stringify(body),
+		});
+		if (!response.ok && body.peer_scope && isRecallPeerScopeCompatibilityStatus(response.status)) {
+			const downgradedBody = { ...body };
+			delete downgradedBody.peer_scope;
+			response = await this.#request<unknown>("/api/v1/search/recall", {
+				method: "POST",
+				body: JSON.stringify(downgradedBody),
+			});
+		}
+		if (!response.ok) {
+			if (isMissingRecallEndpointStatus(response.status)) return null;
+			throw openVikingRequestError("recall", response);
+		}
+		const parsed = parseRecallEntries(response.result);
+		if (!parsed.ok) throw new Error(parsed.error);
+		return selectRecallEntries(parsed.value, limit, query);
+	}
+
 	async #getTask(
 		taskId: string,
 		timeoutMs?: number,
@@ -459,6 +508,54 @@ function parseTaskForId(value: unknown, expectedTaskId: string): ParseResult<Ope
 	return parsed;
 }
 
+function parseRecallEntries(value: unknown): ParseResult<OpenVikingSearchItem[]> {
+	if (!isRecord(value) || !Array.isArray(value.entries)) {
+		return { ok: false, error: "Invalid OpenViking recall response: entries must be an array" };
+	}
+	const optionalStringFields = ["abstract", "overview", "summary", "content", "mode", "origin", "type"] as const;
+	const entries: OpenVikingSearchItem[] = [];
+	for (let index = 0; index < value.entries.length; index++) {
+		const entry = value.entries[index];
+		if (!isRecord(entry) || typeof entry.uri !== "string" || !entry.uri.trim()) {
+			return { ok: false, error: `Invalid OpenViking recall response: entry ${index} requires a URI` };
+		}
+		for (const field of optionalStringFields) {
+			if (entry[field] !== undefined && typeof entry[field] !== "string") {
+				return {
+					ok: false,
+					error: `Invalid OpenViking recall response: entry ${index} has an invalid ${field}`,
+				};
+			}
+		}
+		if (entry.score !== undefined && (typeof entry.score !== "number" || !Number.isFinite(entry.score))) {
+			return { ok: false, error: `Invalid OpenViking recall response: entry ${index} has an invalid score` };
+		}
+		if (
+			entry.rank !== undefined &&
+			(typeof entry.rank !== "number" || !Number.isInteger(entry.rank) || entry.rank < 0)
+		) {
+			return { ok: false, error: `Invalid OpenViking recall response: entry ${index} has an invalid rank` };
+		}
+		const abstract = entry.abstract as string | undefined;
+		const summary = entry.summary as string | undefined;
+		const overview = (entry.overview as string | undefined) ?? summary;
+		entries.push({
+			uri: entry.uri,
+			...(entry.score === undefined ? {} : { score: entry.score }),
+			...(abstract === undefined ? {} : { abstract }),
+			...(overview === undefined ? {} : { overview }),
+			...(summary === undefined ? {} : { summary }),
+			...(entry.content === undefined ? {} : { content: entry.content as string }),
+			...(entry.mode === undefined ? {} : { mode: entry.mode as string }),
+			...(entry.origin === undefined ? {} : { origin: entry.origin as string }),
+			...(entry.rank === undefined ? {} : { rank: entry.rank }),
+			...(entry.type === undefined ? {} : { category: entry.type as string }),
+			_sourceType: "memory",
+		});
+	}
+	return { ok: true, value: entries };
+}
+
 function parseTask(value: unknown): ParseResult<OpenVikingTask> {
 	if (!isRecord(value)) return { ok: false, error: "Invalid OpenViking task response: expected an object" };
 	if (typeof value.task_id !== "string" || !value.task_id.trim()) {
@@ -503,6 +600,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isTaskStatus(value: unknown): value is OpenVikingTaskStatus {
 	return value === "pending" || value === "running" || value === "completed" || value === "failed";
+}
+
+function isRecallPeerScopeCompatibilityStatus(status: number | undefined): boolean {
+	return status === 400 || status === 422;
+}
+
+function isMissingRecallEndpointStatus(status: number | undefined): boolean {
+	return status === 404 || status === 405;
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -569,21 +674,135 @@ function formatOpenVikingError(error: unknown, status: number): string {
 
 function dedupeAndRank(items: OpenVikingSearchItem[], query: string): OpenVikingSearchItem[] {
 	const profile = buildQueryProfile(query);
+	const deduped = dedupeItems(items);
+	deduped.sort((a, b) => rankItem(b, profile) - rankItem(a, profile));
+	return deduped;
+}
+
+/**
+ * OpenViking recall results are already ordered by type quotas, peer penalties,
+ * and per-type rank. Merge independently ranked skills without allowing local
+ * heuristics to reorder one recalled memory ahead of another.
+ */
+function mergeServerRankedRecall(
+	memories: OpenVikingSearchItem[],
+	skills: OpenVikingSearchItem[],
+	query: string,
+): OpenVikingSearchItem[] {
+	const orderedMemories = dedupeRecallByUri(memories);
+	const memoryUris = new Set(orderedMemories.map(item => item.uri));
+	const rankedSkills = dedupeAndRank(
+		skills.filter(item => !memoryUris.has(item.uri)),
+		query,
+	);
+	const profile = buildQueryProfile(query);
+	const merged: OpenVikingSearchItem[] = [];
+	let memoryIndex = 0;
+	let skillIndex = 0;
+	while (memoryIndex < orderedMemories.length || skillIndex < rankedSkills.length) {
+		const memory = orderedMemories[memoryIndex];
+		const skill = rankedSkills[skillIndex];
+		if (!memory) {
+			if (!skill) break;
+			merged.push(skill);
+			skillIndex++;
+		} else if (!skill || rankItem(memory, profile) >= rankItem(skill, profile)) {
+			merged.push(memory);
+			memoryIndex++;
+		} else {
+			merged.push(skill);
+			skillIndex++;
+		}
+	}
+	return merged;
+}
+
+function dedupeRecallByUri(items: OpenVikingSearchItem[]): OpenVikingSearchItem[] {
+	const seen = new Set<string>();
+	return items.filter(item => {
+		if (seen.has(item.uri)) return false;
+		seen.add(item.uri);
+		return true;
+	});
+}
+
+function dedupeItems(items: OpenVikingSearchItem[]): OpenVikingSearchItem[] {
 	const seen = new Set<string>();
 	const deduped: OpenVikingSearchItem[] = [];
 	for (const item of items) {
 		const key = isEventOrCaseItem(item)
 			? `uri:${item.uri}`
-			: (item.abstract || item.overview || "").trim().toLowerCase() || `uri:${item.uri}`;
+			: (item.abstract || item.summary || item.overview || "").trim().toLowerCase() || `uri:${item.uri}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
 		deduped.push(item);
 	}
-	deduped.sort((a, b) => rankItem(b, profile) - rankItem(a, profile));
 	return deduped;
 }
 
-const PREFERENCE_QUERY_RE = /prefer|preference|favorite|favourite|like|偏好|喜欢|爱好|更倾向/i;
+function buildRecallQuotas(limit: number): Record<"events" | "entities" | "preferences" | "experiences", number> {
+	const normalized = Math.max(1, Math.floor(limit));
+	return {
+		events: normalized,
+		entities: normalized,
+		preferences: Math.min(normalized, 3),
+		experiences: 0,
+	};
+}
+
+function buildRecallReservations(
+	limit: number,
+	query: string,
+): Record<"events" | "entities" | "preferences" | "experiences", number> {
+	const normalized = Math.max(1, Math.floor(limit));
+	const wantsPreference = buildQueryProfile(query).wantsPreference;
+	if (normalized === 1) {
+		return wantsPreference
+			? { events: 0, entities: 0, preferences: 1, experiences: 0 }
+			: { events: 1, entities: 0, preferences: 0, experiences: 0 };
+	}
+	if (normalized === 2) {
+		return wantsPreference
+			? { events: 1, entities: 0, preferences: 1, experiences: 0 }
+			: { events: 1, entities: 1, preferences: 0, experiences: 0 };
+	}
+	const preferences = Math.min(3, Math.max(1, Math.floor(normalized / 5)));
+	const remaining = normalized - preferences;
+	return {
+		events: Math.ceil(remaining / 2),
+		entities: Math.floor(remaining / 2),
+		preferences,
+		experiences: 0,
+	};
+}
+
+/**
+ * Reserve cross-type coverage without turning request quotas into a hard
+ * partition. Empty buckets donate their slots to the remaining server-ranked
+ * entries, so an entity-only result can still fill the caller's total limit.
+ */
+function selectRecallEntries(items: OpenVikingSearchItem[], limit: number, query: string): OpenVikingSearchItem[] {
+	const normalized = Math.max(1, Math.floor(limit));
+	const reservations = buildRecallReservations(normalized, query);
+	const selected = new Set<number>();
+	const counts = { events: 0, entities: 0, preferences: 0, experiences: 0 };
+	for (let index = 0; index < items.length; index++) {
+		const category = items[index]?.category;
+		if (!isRecallCategory(category) || counts[category] >= reservations[category]) continue;
+		selected.add(index);
+		counts[category] += 1;
+		if (selected.size === normalized) break;
+	}
+	for (let index = 0; index < items.length && selected.size < normalized; index++) selected.add(index);
+	return items.filter((_item, index) => selected.has(index));
+}
+
+function isRecallCategory(value: string | undefined): value is "events" | "entities" | "preferences" | "experiences" {
+	return value === "events" || value === "entities" || value === "preferences" || value === "experiences";
+}
+
+const PREFERENCE_QUERY_RE =
+	/\bpreferences?\b|\bprefer(?:s|red|ring)?\b|\bfavou?rites?\b|\blike(?:s|d|ing)?\b|偏好|喜欢|爱好|更倾向/i;
 const TEMPORAL_QUERY_RE =
 	/when|what time|date|day|month|year|yesterday|today|tomorrow|last|next|什么时候|何时|哪天|几月|几年|昨天|今天|明天/i;
 const QUERY_TOKEN_RE = /[a-z0-9一-龥]{2,}/gi;

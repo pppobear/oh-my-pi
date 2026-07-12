@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { getOpenVikingEnvironmentVariable, loadOpenVikingConfig } from "@oh-my-pi/pi-coding-agent/openviking/config";
+import {
+	deriveOpenVikingWorkspacePeerId,
+	getOpenVikingEnvironmentVariable,
+	loadOpenVikingConfig,
+} from "@oh-my-pi/pi-coding-agent/openviking/config";
 
 async function writeProfile(dir: string, name: string, value: unknown): Promise<string> {
 	const filePath = path.join(dir, name);
@@ -12,6 +16,34 @@ async function writeProfile(dir: string, name: string, value: unknown): Promise<
 }
 
 describe("OpenViking configuration profiles", () => {
+	it("accepts an ovcli profile through the legacy OPENVIKING_CONFIG_FILE variable", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
+		try {
+			const cliPath = await writeProfile(dir, "custom-ovcli.conf", {
+				url: "https://compat.openviking.test/",
+				api_key: "compat-cli-secret",
+				account_id: "compat-account",
+				user_id: "compat-user",
+				actor_peer_id: "compat-peer",
+			});
+
+			const config = await loadOpenVikingConfig(Settings.isolated(), {
+				OPENVIKING_CONFIG_FILE: cliPath,
+			});
+
+			expect(config).toMatchObject({
+				baseUrl: "https://compat.openviking.test",
+				apiKey: "compat-cli-secret",
+				accountId: "compat-account",
+				userId: "compat-user",
+				peerId: "compat-peer",
+				peerSource: "explicit",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not combine an ovcli URL with credentials from legacy ov.conf", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
 		try {
@@ -39,7 +71,9 @@ describe("OpenViking configuration profiles", () => {
 			expect(config.apiKey).toBeNull();
 			expect(config.accountId).toBe("remote-account");
 			expect(config.userId).toBe("remote-user");
-			expect(config.peerId).toBeNull();
+			expect(config.peerId).toBe(deriveOpenVikingWorkspacePeerId(Settings.isolated().getCwd()));
+			expect(config.peerSource).toBe("workspace");
+			expect(config.workspacePeer).toBe(true);
 
 			await Bun.write(
 				cliPath,
@@ -80,6 +114,176 @@ describe("OpenViking configuration profiles", () => {
 				userId: "legacy-user",
 				peerId: "legacy-peer",
 			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reads current ovcli identity aliases even when the default URL is omitted", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
+		try {
+			const legacyPath = await writeProfile(dir, "ov.conf", {
+				server: { url: "https://legacy.openviking.test", root_api_key: "legacy-secret" },
+				codex: { peerId: "legacy-peer" },
+			});
+			const cliPath = await writeProfile(dir, "ovcli.conf", {
+				api_key: "cli-secret",
+				account_id: "cli-account",
+				user_id: "cli-user",
+				actor_peer_id: "cli-peer",
+			});
+
+			const config = await loadOpenVikingConfig(Settings.isolated(), {
+				OPENVIKING_CONFIG_FILE: legacyPath,
+				OPENVIKING_CLI_CONFIG_FILE: cliPath,
+			});
+
+			expect(config).toMatchObject({
+				baseUrl: "https://legacy.openviking.test",
+				apiKey: "cli-secret",
+				accountId: "cli-account",
+				userId: "cli-user",
+				peerId: "cli-peer",
+				peerSource: "explicit",
+			});
+
+			await Bun.write(cliPath, JSON.stringify({ api_key: "cli-secret", peer_id: "compat-peer" }));
+			const compatible = await loadOpenVikingConfig(Settings.isolated(), {
+				OPENVIKING_CONFIG_FILE: legacyPath,
+				OPENVIKING_CLI_CONFIG_FILE: cliPath,
+			});
+			expect(compatible.peerId).toBe("compat-peer");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("honors the official credential source selectors", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
+		try {
+			const legacyPath = await writeProfile(dir, "ov.conf", {
+				server: { url: "https://legacy.openviking.test", root_api_key: "legacy-secret" },
+			});
+			const cliPath = await writeProfile(dir, "ovcli.conf", {
+				url: "https://cli.openviking.test",
+				api_key: "cli-secret",
+				account_id: "cli-account",
+				user_id: "cli-user",
+				actor_peer_id: "cli-peer",
+			});
+			const paths = {
+				OPENVIKING_CONFIG_FILE: legacyPath,
+				OPENVIKING_CLI_CONFIG_FILE: cliPath,
+			};
+
+			const forcedCli = await loadOpenVikingConfig(Settings.isolated(), {
+				...paths,
+				OPENVIKING_CREDENTIAL_SOURCE: "cli",
+				OPENVIKING_URL: "https://stale-env.openviking.test",
+				OPENVIKING_API_KEY: "stale-env-secret",
+				OPENVIKING_ACCOUNT: "stale-account",
+				OPENVIKING_USER: "stale-user",
+				OPENVIKING_PEER_ID: "stale-peer",
+			});
+			expect(forcedCli).toMatchObject({
+				baseUrl: "https://cli.openviking.test",
+				apiKey: "cli-secret",
+				accountId: "cli-account",
+				userId: "cli-user",
+				peerId: "cli-peer",
+			});
+
+			const forcedEnvironment = await loadOpenVikingConfig(Settings.isolated(), {
+				...paths,
+				OPENVIKING_CREDENTIALS_SOURCE: "environment",
+				OPENVIKING_API_KEY: "environment-secret",
+			});
+			expect(forcedEnvironment.baseUrl).toBe("https://legacy.openviking.test");
+			expect(forcedEnvironment.apiKey).toBe("environment-secret");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps ovcli identity fallback in environment credential mode without ov.conf", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
+		try {
+			const cliPath = await writeProfile(dir, "ovcli.conf", {
+				url: "https://ignored-cli.openviking.test",
+				api_key: "cli-fallback-secret",
+				account_id: "cli-fallback-account",
+				user_id: "cli-fallback-user",
+				actor_peer_id: "cli-fallback-peer",
+			});
+
+			const config = await loadOpenVikingConfig(Settings.isolated(), {
+				OPENVIKING_CONFIG_FILE: path.join(dir, "missing-ov.conf"),
+				OPENVIKING_CLI_CONFIG_FILE: cliPath,
+				OPENVIKING_CREDENTIAL_SOURCE: "env",
+			});
+
+			expect(config).toMatchObject({
+				baseUrl: "http://127.0.0.1:1933",
+				apiKey: "cli-fallback-secret",
+				accountId: "cli-fallback-account",
+				userId: "cli-fallback-user",
+				peerId: "cli-fallback-peer",
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not promote a legacy ovcli agent_id into the workspace peer", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
+		try {
+			const cliPath = await writeProfile(dir, "ovcli.conf", {
+				api_key: "cli-secret",
+				agent_id: "legacy-agent",
+			});
+			const settings = Settings.isolated();
+			const config = await loadOpenVikingConfig(settings, {
+				OPENVIKING_CONFIG_FILE: path.join(dir, "missing-ov.conf"),
+				OPENVIKING_CLI_CONFIG_FILE: cliPath,
+			});
+
+			expect(config.apiKey).toBe("cli-secret");
+			expect(config.peerId).toBe(deriveOpenVikingWorkspacePeerId(settings.getCwd()));
+			expect(config.peerSource).toBe("workspace");
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reads current codex tuning and legacy peer aliases from ov.conf", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-profile-"));
+		try {
+			const legacyPath = await writeProfile(dir, "ov.conf", {
+				server: { url: "http://127.0.0.1:1933" },
+				claude_code: { autoRecall: true, peerId: "old-peer" },
+				codex: { autoRecall: false, peer_id: "codex-peer" },
+			});
+			const missingCli = path.join(dir, "missing-ovcli.conf");
+
+			const config = await loadOpenVikingConfig(Settings.isolated(), {
+				OPENVIKING_CONFIG_FILE: legacyPath,
+				OPENVIKING_CLI_CONFIG_FILE: missingCli,
+			});
+			expect(config.peerId).toBe("codex-peer");
+			expect(config.peerSource).toBe("explicit");
+			expect(config.autoRecall).toBe(false);
+
+			await Bun.write(
+				legacyPath,
+				JSON.stringify({ server: { url: "http://127.0.0.1:1933" }, codex: { workspacePeer: false } }),
+			);
+			const optedOut = await loadOpenVikingConfig(Settings.isolated(), {
+				OPENVIKING_CONFIG_FILE: legacyPath,
+				OPENVIKING_CLI_CONFIG_FILE: missingCli,
+			});
+			expect(optedOut.peerId).toBeNull();
+			expect(optedOut.peerSource).toBe("none");
+			expect(optedOut.workspacePeer).toBe(false);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -174,5 +378,55 @@ describe("OpenViking configuration profiles", () => {
 
 		expect(config.autoRecall).toBe(false);
 		expect(getOpenVikingEnvironmentVariable("openviking.autoRecall", env)).toBeUndefined();
+	});
+
+	it("derives a workspace peer by default and supports explicit override or opt-out", async () => {
+		const settings = Settings.isolated();
+		const missingProfiles = {
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-openviking-workspace-peer-missing.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-openviking-workspace-peer-missing-cli.conf",
+		};
+
+		expect(deriveOpenVikingWorkspacePeerId("/Users/x/Dev/OpenViking")).toBe("-Users-x-Dev-OpenViking");
+		expect((await loadOpenVikingConfig(settings, missingProfiles)).peerId).toBe(
+			deriveOpenVikingWorkspacePeerId(settings.getCwd()),
+		);
+		expect(
+			(await loadOpenVikingConfig(settings, { ...missingProfiles, OPENVIKING_PEER_ID: "explicit-peer" })).peerId,
+		).toBe("explicit-peer");
+		expect(
+			(await loadOpenVikingConfig(settings, { ...missingProfiles, OPENVIKING_WORKSPACE_PEER: "0" })).peerId,
+		).toBeNull();
+		expect(
+			(await loadOpenVikingConfig(settings, { ...missingProfiles, OPENVIKING_WORKSPACE_PEER: "0" })).workspacePeer,
+		).toBe(false);
+		expect(
+			(await loadOpenVikingConfig(settings, { ...missingProfiles, OPENVIKING_WORKSPACE_PEER: "off" })).workspacePeer,
+		).toBe(false);
+		expect(
+			(await loadOpenVikingConfig(settings, { ...missingProfiles, OPENVIKING_WORKSPACE_PEER: "on" })).workspacePeer,
+		).toBe(true);
+	});
+
+	it("defaults recall to the actor peer and accepts an explicit all-peer scope", async () => {
+		const missingProfiles = {
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-openviking-recall-scope-missing.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-openviking-recall-scope-missing-cli.conf",
+		};
+
+		expect((await loadOpenVikingConfig(Settings.isolated(), missingProfiles)).recallPeerScope).toBe("actor");
+		expect(
+			(
+				await loadOpenVikingConfig(Settings.isolated(), {
+					...missingProfiles,
+					OPENVIKING_RECALL_PEER_SCOPE: "all",
+				})
+			).recallPeerScope,
+		).toBe("all");
+		expect(
+			getOpenVikingEnvironmentVariable("openviking.recallPeerScope", {
+				OPENVIKING_RECALL_PEER_SCOPE: "invalid",
+			}),
+		).toBeUndefined();
 	});
 });

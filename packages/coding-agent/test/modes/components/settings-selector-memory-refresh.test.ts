@@ -337,6 +337,49 @@ describe("SettingsSelectorComponent memory tab", () => {
 		}
 	});
 
+	it("shows the effective workspace-peer opt-out from the environment", async () => {
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_WORKSPACE_PEER: "0",
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-settings-selector-workspace-peer-missing-ov.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-settings-selector-workspace-peer-missing-ovcli.conf",
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			const comp = createSelector();
+			for (const ch of "openviking workspace peer") comp.handleInput(ch);
+			await waitForRender(comp, output => output.includes("false (OPENVIKING_WORKSPACE_PEER)"));
+			selectSearchResultByDescription(comp, "Controlled by OPENVIKING_WORKSPACE_PEER");
+			const rendered = renderPlain(comp);
+
+			expect(rendered).toContain("Controlled by OPENVIKING_WORKSPACE_PEER");
+			expect(settings.get("openviking.workspacePeer")).toBe(true);
+			comp.handleInput("\n");
+			expect(settings.get("openviking.workspacePeer")).toBe(true);
+		} finally {
+			restoreEnvironment();
+		}
+	});
+
+	it("shows the effective recall peer scope from the environment", async () => {
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_RECALL_PEER_SCOPE: "all",
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-settings-selector-recall-scope-missing-ov.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-settings-selector-recall-scope-missing-ovcli.conf",
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			const comp = createSelector();
+			for (const ch of "openviking recall peer scope") comp.handleInput(ch);
+			await waitForRender(comp, output => output.includes("all (OPENVIKING_RECALL_PEER_SCOPE)"));
+			const rendered = renderPlain(comp);
+
+			expect(rendered).toContain("all (OPENVIKING_RECALL_PEER_SCOPE)");
+			expect(settings.get("openviking.recallPeerScope")).toBe("actor");
+		} finally {
+			restoreEnvironment();
+		}
+	});
+
 	it("keeps OpenViking settings editable when a boolean environment value is invalid", async () => {
 		const configPath = "/tmp/omp-settings-selector-invalid-env-missing-ov.conf";
 		const cliConfigPath = "/tmp/omp-settings-selector-invalid-env-missing-ovcli.conf";

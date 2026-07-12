@@ -35,6 +35,8 @@ export interface AgentRef {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	/** Live memory ownership group; task children inherit it while independent clones do not. */
+	memoryBackendGroupId?: string;
 	status: AgentStatus;
 	/** Null exactly when parked/aborted. */
 	session: AgentSession | null;
@@ -57,6 +59,7 @@ export interface RegisterInput {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	memoryBackendGroupId?: string;
 	session: AgentSession | null;
 	sessionFile?: string | null;
 	status?: AgentStatus;
@@ -87,6 +90,7 @@ export class AgentRegistry {
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
+			memoryBackendGroupId: input.memoryBackendGroupId,
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,

@@ -38,7 +38,7 @@ import type { InteractiveModeContext } from "../../modes/types";
 import { computeContextBreakdown, renderContextUsage } from "../../modes/utils/context-usage";
 import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
 import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
-import type { AsyncJobSnapshotItem } from "../../session/agent-session";
+import type { AsyncJobSnapshotItem, MemoryBackendWorkspaceTransition } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
@@ -961,6 +961,10 @@ export class CommandController {
 
 		const cwd = this.ctx.sessionManager.getCwd();
 		const resolvedPath = resolveToCwd(unquoted, cwd);
+		if (path.resolve(resolvedPath) === path.resolve(cwd)) {
+			this.ctx.showStatus(`Already in ${resolvedPath}.`);
+			return;
+		}
 
 		// If the directory doesn't exist, offer to create it.
 		let isDirectory: boolean;
@@ -995,14 +999,49 @@ export class CommandController {
 			}
 		}
 
+		let memoryTransition: MemoryBackendWorkspaceTransition | undefined;
 		try {
-			await this.ctx.sessionManager.moveTo(resolvedPath);
+			memoryTransition = await this.ctx.session.suspendMemoryBackendForWorkspaceTransition();
 		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			this.ctx.showError(`Move cancelled: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
 
-		await this.ctx.applyCwdChange(resolvedPath);
+		try {
+			await this.ctx.sessionManager.moveTo(resolvedPath);
+		} catch (err) {
+			const partiallyMoved = path.resolve(this.ctx.sessionManager.getCwd()) !== path.resolve(cwd);
+			if (memoryTransition) {
+				try {
+					await memoryTransition.complete({ restart: !partiallyMoved });
+				} catch (restartError) {
+					this.ctx.showWarning(
+						`Memory backend restore failed: ${restartError instanceof Error ? restartError.message : String(restartError)}`,
+					);
+				}
+			}
+			this.ctx.showError(
+				partiallyMoved
+					? `Move partially applied; memory remains inactive: ${err instanceof Error ? err.message : String(err)}`
+					: `Move failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+
+		try {
+			if (memoryTransition) await this.ctx.applyCwdChange(resolvedPath, memoryTransition);
+			else await this.ctx.applyCwdChange(resolvedPath);
+		} catch (err) {
+			try {
+				await memoryTransition?.complete({ restart: false });
+			} catch {
+				// The transition already released fail-closed; preserve the cwd error below.
+			}
+			this.ctx.showError(
+				`Session moved to ${resolvedPath}, but destination settings could not be loaded; memory remains inactive: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
 
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();

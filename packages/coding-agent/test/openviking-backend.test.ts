@@ -13,14 +13,22 @@ import {
 	type OpenVikingTask,
 	type OpenVikingTaskWaitResult,
 } from "@oh-my-pi/pi-coding-agent/openviking/client";
-import { loadOpenVikingConfig, type OpenVikingConfig } from "@oh-my-pi/pi-coding-agent/openviking/config";
+import {
+	deriveOpenVikingWorkspacePeerId,
+	loadOpenVikingConfig,
+	type OpenVikingConfig,
+} from "@oh-my-pi/pi-coding-agent/openviking/config";
 import {
 	getOpenVikingSessionState,
 	OpenVikingSessionState,
 	setOpenVikingSessionState,
 } from "@oh-my-pi/pi-coding-agent/openviking/state";
 import { AgentSession, type AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { CustomEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import {
+	type CustomEntry,
+	SESSION_CWD_TRANSITION_CUSTOM_TYPE,
+	type SessionEntry,
+} from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools } from "@oh-my-pi/pi-coding-agent/tools";
 
@@ -30,6 +38,9 @@ const baseConfig: OpenVikingConfig = {
 	accountId: null,
 	userId: null,
 	peerId: null,
+	peerSource: "none",
+	workspacePeer: false,
+	recallPeerScope: "actor",
 	timeoutMs: 1_000,
 	captureTimeoutMs: 1_000,
 	autoRecall: true,
@@ -90,6 +101,15 @@ const OPENVIKING_ENV_KEYS = [
 	"OPENVIKING_BASE_URL",
 	"OPENVIKING_CONFIG_FILE",
 	"OPENVIKING_CLI_CONFIG_FILE",
+	"OPENVIKING_CREDENTIAL_SOURCE",
+	"OPENVIKING_CREDENTIALS_SOURCE",
+	"OPENVIKING_API_KEY",
+	"OPENVIKING_BEARER_TOKEN",
+	"OPENVIKING_ACCOUNT",
+	"OPENVIKING_USER",
+	"OPENVIKING_PEER_ID",
+	"OPENVIKING_WORKSPACE_PEER",
+	"OPENVIKING_RECALL_PEER_SCOPE",
 ] as const;
 const savedOpenVikingEnv: Partial<Record<(typeof OPENVIKING_ENV_KEYS)[number], string>> = {};
 const MISSING_OPENVIKING_CONFIG = "/tmp/omp-openviking-test-missing.conf";
@@ -115,8 +135,10 @@ function makeFakeSession(settings: Settings, entries: Array<{ role: "user" | "as
 		sessionId: "session-1",
 		settings,
 		sessionManager: {
+			getSessionId: () => "session-1",
 			getEntries: sessionEntries,
 			getBranch: sessionEntries,
+			async flush() {},
 			appendCustomEntry(customType: string, data?: unknown) {
 				const index = customEntries.length;
 				const entry: CustomEntry = {
@@ -147,7 +169,7 @@ function makeFakeSession(settings: Settings, entries: Array<{ role: "user" | "as
 	return session as {
 		sessionId: string;
 		settings: Settings;
-		sessionManager: { appendCustomEntry(customType: string, data?: unknown): string };
+		sessionManager: { appendCustomEntry(customType: string, data?: unknown): string; flush(): Promise<void> };
 		emit(event: Parameters<AgentSessionEventListener>[0]): void;
 		customEntries: CustomEntry[];
 		notices: Array<{ level: string; message: string; source?: string }>;
@@ -230,6 +252,40 @@ describe("OpenViking memory backend", () => {
 		expect(requestedPaths).toContain("/api/v1/sessions/omp-session-1?auto_create=false");
 	});
 
+	it("reports a stale child alias as inactive without probing its replacement primary", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const parentSession = makeFakeSession(settings);
+		const childSession = makeFakeSession(settings);
+		const client = {
+			ensureSession: vi.fn(async () => ({ ok: true })),
+			health: vi.fn(async () => ({ ok: true })),
+			ready: vi.fn(async () => ({ ok: true })),
+			getSession: vi.fn(async () => ({ ok: true })),
+		} as unknown as OpenVikingApi;
+		const parent = new OpenVikingSessionState({
+			sessionId: "parent-a",
+			config: baseConfig,
+			client,
+			session: parentSession as never,
+		});
+		const child = new OpenVikingSessionState({
+			sessionId: "child",
+			config: baseConfig,
+			client,
+			session: childSession as never,
+			aliasOf: parent,
+		});
+		setOpenVikingSessionState(childSession as never, child);
+		await parent.rekeySession("parent-b");
+
+		await expect(
+			openVikingBackend.status?.({ agentDir: "/tmp/agent", cwd: "/tmp/project", session: childSession as never }),
+		).resolves.toMatchObject({ active: false, writable: false, searchable: false });
+		expect(client.health).not.toHaveBeenCalled();
+		expect(client.ready).not.toHaveBeenCalled();
+		expect(client.getSession).not.toHaveBeenCalled();
+	});
+
 	it("injects searched OpenViking context before an agent turn", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		const session = makeFakeSession(settings);
@@ -257,6 +313,153 @@ describe("OpenViking memory backend", () => {
 		expect(injected).toContain("<openviking-context>");
 		expect(injected).toContain("Prefers concise code reviews.");
 		expect(client.search).toHaveBeenCalled();
+	});
+
+	it("uses content returned by peer-aware recall without re-reading a hidden peer URI", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const client = {
+			search: vi.fn(async () => [
+				{
+					uri: "viking://user/default/peers/other/memories/events/deploy.md",
+					score: 0.9,
+					abstract: "Abstract that must not replace full mode.",
+					content: "Deployment completed successfully.",
+					mode: "full",
+					origin: "other_peer",
+					_sourceType: "memory",
+				},
+				{
+					uri: "viking://user/default/peers/other/memories/entities/service.md",
+					score: 0.8,
+					abstract: "Abstract that must not replace summary mode.",
+					summary: "Service ownership belongs to the platform team.",
+					mode: "summary",
+					origin: "other_peer",
+					_sourceType: "memory",
+				},
+				{
+					uri: "viking://user/default/peers/other/memories/preferences/uri-only.md",
+					score: 0.7,
+					abstract: "This abstract exceeded the server budget.",
+					mode: "uri",
+					origin: "other_peer",
+					_sourceType: "memory",
+				},
+			]),
+			readContent: vi.fn(async () => {
+				throw new Error("other peer is hidden from actor reads");
+			}),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: { ...baseConfig, recallPeerScope: "all" },
+			client,
+			session: session as never,
+		});
+
+		const deploymentRecall = await state.recallForContext("deployment status");
+		expect(deploymentRecall).toContain("Deployment completed successfully.");
+		expect(deploymentRecall).toContain("[memory/other-projects 90%]");
+		expect(deploymentRecall).not.toContain("Abstract that must not replace full mode.");
+		const ownershipRecall = await state.recallForContext("service ownership");
+		expect(ownershipRecall).toContain("Service ownership belongs to the platform team.");
+		expect(ownershipRecall).toContain("[memory/other-projects 80%]");
+		expect(ownershipRecall).not.toContain("Abstract that must not replace summary mode.");
+		expect(ownershipRecall).toContain("memory://user/default/peers/other/memories/preferences/uri-only.md");
+		expect(ownershipRecall).not.toContain("This abstract exceeded the server budget.");
+		expect(client.readContent).not.toHaveBeenCalled();
+	});
+
+	it("drops an in-flight recall result after its workspace state is disposed", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const pending =
+			Promise.withResolvers<Array<{ uri: string; score: number; abstract: string; _sourceType: "memory" }>>();
+		const client = { search: vi.fn(async () => await pending.promise) } as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: baseConfig,
+			client,
+			session: session as never,
+		});
+
+		const search = state.search("workspace secret", 1);
+		await state.dispose({ flush: false });
+		pending.resolve([
+			{
+				uri: "viking://user/memories/entities/secret.md",
+				score: 0.9,
+				abstract: "old workspace secret",
+				_sourceType: "memory",
+			},
+		]);
+
+		await expect(search).resolves.toEqual([]);
+		expect(state.isReady).toBe(false);
+	});
+
+	it("drops resolved legacy content when the workspace changes during a backend search", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const content = Promise.withResolvers<string | null>();
+		const readContent = vi.fn(async () => await content.promise);
+		const client = {
+			search: vi.fn(async () => [
+				{
+					uri: "viking://user/memories/entities/secret.md",
+					score: 0.9,
+					level: 2,
+					_sourceType: "memory" as const,
+				},
+			]),
+			readContent,
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: { ...baseConfig, recallPreferAbstract: false },
+			client,
+			session: session as never,
+		});
+		setOpenVikingSessionState(session as never, state);
+
+		const search = openVikingBackend.search?.(
+			{ agentDir: "/tmp/agent", cwd: "/tmp/project", session: session as never },
+			"workspace secret",
+		);
+		for (let attempt = 0; attempt < 100 && readContent.mock.calls.length === 0; attempt++) await Bun.sleep(1);
+		expect(readContent).toHaveBeenCalled();
+		await state.dispose({ flush: false });
+		content.resolve("old workspace secret");
+
+		await expect(search).resolves.toMatchObject({ count: 0, items: [] });
+	});
+
+	it("drops deferred session context when the workspace changes during compaction recall", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const context = Promise.withResolvers<string | null>();
+		const getSessionContext = vi.fn(async () => await context.promise);
+		const client = {
+			search: vi.fn(async () => []),
+			getSessionContext,
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: baseConfig,
+			client,
+			session: session as never,
+		});
+
+		const recall = state.recallForCompaction([
+			{ role: "user", content: "summarize this workspace", timestamp: Date.now() },
+		]);
+		for (let attempt = 0; attempt < 100 && getSessionContext.mock.calls.length === 0; attempt++) await Bun.sleep(1);
+		expect(getSessionContext).toHaveBeenCalled();
+		await state.dispose({ flush: false });
+		context.resolve("old workspace session context");
+
+		await expect(recall).resolves.toBeUndefined();
 	});
 
 	it("exposes recalled OpenViking documents through memory URLs", async () => {
@@ -319,6 +522,49 @@ describe("OpenViking memory backend", () => {
 				metadata: expect.objectContaining({ uri: "memory://user/default/memories/preferences/editor.md" }),
 			}),
 		]);
+	});
+
+	it("returns recall content from structured backend searches without re-reading hidden peers", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const client = {
+			search: vi.fn(async () => [
+				{
+					uri: "viking://user/default/peers/other/memories/entities/service.md",
+					score: 0.9,
+					content: "Service ownership belongs to the platform team.",
+					mode: "full",
+					origin: "other_peer",
+					rank: 1,
+					_sourceType: "memory",
+				},
+			]),
+			readContent: vi.fn(async () => {
+				throw new Error("other peer is hidden from actor reads");
+			}),
+		} as unknown as OpenVikingApi;
+		setOpenVikingSessionState(
+			session as never,
+			new OpenVikingSessionState({
+				sessionId: "session-1",
+				config: { ...baseConfig, recallPeerScope: "all", recallPreferAbstract: false },
+				client,
+				session: session as never,
+			}),
+		);
+
+		const result = await openVikingBackend.search?.(
+			{ agentDir: "/tmp/agent", cwd: "/tmp/project", session: session as never },
+			"service ownership",
+		);
+
+		expect(result?.items).toEqual([
+			expect.objectContaining({
+				content: "Service ownership belongs to the platform team.",
+				metadata: expect.objectContaining({ origin: "other_peer", rank: 1, mode: "full" }),
+			}),
+		]);
+		expect(client.readContent).not.toHaveBeenCalled();
 	});
 
 	it("maps explicit save outcomes without overstating stored or queued state", async () => {
@@ -1561,6 +1807,345 @@ describe("OpenViking memory backend", () => {
 		expect(client.commitSession).toHaveBeenCalledTimes(1);
 		const latestCursor = session.customEntries.at(-1)?.data as { version?: number } | undefined;
 		expect(latestCursor?.version).toBe(4);
+	});
+
+	it("adopts an unscoped cursor once when upgrading to the derived workspace peer", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const entries = [{ role: "user" as const, content: "captured before workspace peers" }];
+		const session = makeFakeSession(settings, entries);
+		session.customEntries.push({
+			id: "unscoped-cursor",
+			parentId: "message-0",
+			timestamp: new Date(0).toISOString(),
+			type: "custom",
+			customType: "openviking-capture-cursor",
+			data: {
+				version: 4,
+				identity: {
+					baseUrl: baseConfig.baseUrl,
+					credentialFingerprint: null,
+					accountId: null,
+					userId: null,
+					peerId: null,
+					sessionId: "omp-session-1",
+				},
+				capturedMessageCount: 1,
+				archivedUserTurns: 1,
+				hasUnarchivedRemoteMessages: false,
+				commitTaskBaseline: null,
+				pendingExtractions: [],
+			},
+		});
+		const client = {
+			baseUrl: baseConfig.baseUrl,
+			addMessage: vi.fn(async () => ({ ok: true })),
+			commitSession: vi.fn(async () => commitAccepted()),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: {
+				...baseConfig,
+				peerId: "-tmp-project",
+				peerSource: "workspace",
+				workspacePeer: true,
+			},
+			client,
+			session: session as never,
+		});
+
+		await state.maybeRetainOnAgentEnd([]);
+
+		expect(state.lastCapturedMessageCount).toBe(1);
+		expect(client.addMessage).not.toHaveBeenCalled();
+		expect(client.commitSession).not.toHaveBeenCalled();
+	});
+
+	it("does not adopt an unscoped cursor for an explicit peer change", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const entries = [{ role: "user" as const, content: "replay for explicit scope" }];
+		const session = makeFakeSession(settings, entries);
+		session.customEntries.push({
+			id: "unscoped-cursor",
+			parentId: "message-0",
+			timestamp: new Date(0).toISOString(),
+			type: "custom",
+			customType: "openviking-capture-cursor",
+			data: {
+				version: 4,
+				identity: {
+					baseUrl: baseConfig.baseUrl,
+					credentialFingerprint: null,
+					accountId: null,
+					userId: null,
+					peerId: null,
+					sessionId: "omp-session-1",
+				},
+				capturedMessageCount: 1,
+				archivedUserTurns: 1,
+				hasUnarchivedRemoteMessages: false,
+				commitTaskBaseline: null,
+				pendingExtractions: [],
+			},
+		});
+		const client = {
+			baseUrl: baseConfig.baseUrl,
+			addMessage: vi.fn(async () => ({ ok: true })),
+			commitSession: vi.fn(async () => commitAccepted()),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: { ...baseConfig, peerId: "explicit-peer", peerSource: "explicit", workspacePeer: true },
+			client,
+			session: session as never,
+		});
+
+		await state.maybeRetainOnAgentEnd([]);
+
+		expect(client.addMessage).toHaveBeenCalledWith("omp-session-1", {
+			role: "user",
+			content: "replay for explicit scope",
+		});
+	});
+
+	it("does not adopt an old unscoped cursor past a newer peer-scoped cursor", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const entries = [
+			{ role: "user" as const, content: "first message" },
+			{ role: "user" as const, content: "second message" },
+		];
+		const session = makeFakeSession(settings, entries);
+		const cursorData = (peerId: string | null, capturedMessageCount: number) => ({
+			version: 4,
+			identity: {
+				baseUrl: baseConfig.baseUrl,
+				credentialFingerprint: null,
+				accountId: null,
+				userId: null,
+				peerId,
+				sessionId: "omp-session-1",
+			},
+			capturedMessageCount,
+			archivedUserTurns: capturedMessageCount,
+			hasUnarchivedRemoteMessages: false,
+			commitTaskBaseline: null,
+			pendingExtractions: [],
+		});
+		session.customEntries.push(
+			{
+				id: "old-unscoped-cursor",
+				parentId: "message-0",
+				timestamp: new Date(0).toISOString(),
+				type: "custom",
+				customType: "openviking-capture-cursor",
+				data: cursorData(null, 1),
+			},
+			{
+				id: "newer-scoped-cursor",
+				parentId: "message-1",
+				timestamp: new Date(1).toISOString(),
+				type: "custom",
+				customType: "openviking-capture-cursor",
+				data: cursorData("previous-project", 2),
+			},
+		);
+		const client = {
+			baseUrl: baseConfig.baseUrl,
+			addMessage: vi.fn(async () => ({ ok: true })),
+			commitSession: vi.fn(async () => commitAccepted()),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: {
+				...baseConfig,
+				peerId: "current-project",
+				peerSource: "workspace",
+				workspacePeer: true,
+			},
+			client,
+			session: session as never,
+		});
+
+		await state.maybeRetainOnAgentEnd([]);
+
+		expect(client.addMessage).toHaveBeenCalledTimes(2);
+		expect(client.addMessage).toHaveBeenNthCalledWith(1, "omp-session-1", {
+			role: "user",
+			content: "first message",
+		});
+	});
+
+	it("uses a durable cwd transition as the destination workspace baseline when no old state survives", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings, [{ role: "user", content: "belongs to the previous workspace" }]);
+		session.customEntries.push({
+			id: "cwd-transition",
+			parentId: "message-0",
+			timestamp: new Date(0).toISOString(),
+			type: "custom",
+			customType: SESSION_CWD_TRANSITION_CUSTOM_TYPE,
+			data: { version: 1, fromCwd: "/workspace/a", toCwd: "/workspace/b" },
+		});
+		const client = {
+			baseUrl: baseConfig.baseUrl,
+			addMessage: vi.fn(async () => ({ ok: true })),
+			commitSession: vi.fn(async () => commitAccepted()),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: {
+				...baseConfig,
+				peerId: "workspace-b",
+				peerSource: "workspace",
+				workspacePeer: true,
+			},
+			client,
+			session: session as never,
+		});
+
+		await state.maybeRetainOnAgentEnd([]);
+
+		expect(state.lastCapturedMessageCount).toBe(1);
+		expect(client.addMessage).not.toHaveBeenCalled();
+	});
+
+	it("captures destination messages added after the durable cwd boundary", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const sessionManager = SessionManager.inMemory("/workspace/a");
+		sessionManager.appendMessage({ role: "user", content: "old workspace history", timestamp: 1 });
+		await sessionManager.moveTo("/workspace/b");
+		sessionManager.appendMessage({ role: "user", content: "new workspace turn", timestamp: 2 });
+		const session = makeFakeSession(settings);
+		Object.assign(session, { sessionManager });
+		const client = {
+			baseUrl: baseConfig.baseUrl,
+			addMessage: vi.fn(async () => ({ ok: true })),
+			commitSession: vi.fn(async () => commitAccepted()),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: {
+				...baseConfig,
+				peerId: "workspace-b",
+				peerSource: "workspace",
+				workspacePeer: true,
+			},
+			client,
+			session: session as never,
+		});
+
+		await state.maybeRetainOnAgentEnd([]);
+
+		expect(client.addMessage).toHaveBeenCalledTimes(1);
+		expect(client.addMessage).toHaveBeenCalledWith("omp-session-1", {
+			role: "user",
+			content: "new workspace turn",
+		});
+	});
+
+	it("refuses a workspace baseline when the old scope cannot flush", async () => {
+		const projectB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-project-b-"));
+		const settings = Settings.isolated({
+			"memory.backend": "openviking",
+			"openviking.apiUrl": baseConfig.baseUrl,
+		});
+		const entries = [{ role: "user" as const, content: "belongs only to project A" }];
+		const session = makeFakeSession(settings, entries);
+		const clientA = {
+			baseUrl: baseConfig.baseUrl,
+			addMessage: vi.fn(async () => ({ ok: false, error: "old workspace unavailable" })),
+			commitSession: vi.fn(async () => commitAccepted()),
+		} as unknown as OpenVikingApi;
+		const stateA = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: {
+				...baseConfig,
+				peerId: "-tmp-project-a",
+				peerSource: "workspace",
+				workspacePeer: true,
+			},
+			client: clientA,
+			session: session as never,
+			lastCapturedMessageCount: 0,
+			lastCommittedTurn: 0,
+		});
+		setOpenVikingSessionState(session as never, stateA);
+
+		try {
+			await settings.reloadForCwd(projectB);
+			await expect(openVikingBackend.stop?.({ session: session as never })).rejects.toThrow(
+				"source transcript tail was not flushed",
+			);
+			const configB = await loadOpenVikingConfig(settings);
+
+			expect(configB.peerSource).toBe("workspace");
+			expect(configB.peerId).toBe(deriveOpenVikingWorkspacePeerId(projectB));
+			expect(clientA.addMessage).toHaveBeenCalledTimes(1);
+			expect(getOpenVikingSessionState(session as never)).toBeUndefined();
+			expect(JSON.stringify(session.customEntries)).not.toContain(configB.peerId);
+		} finally {
+			await fs.rm(projectB, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a workspace move with a fixed explicit peer when the old flush throws", async () => {
+		const projectB = await fs.mkdtemp(path.join(os.tmpdir(), "omp-openviking-explicit-project-b-"));
+		const settings = Settings.isolated({
+			"memory.backend": "openviking",
+			"openviking.apiUrl": baseConfig.baseUrl,
+			"openviking.peerId": "project-a-peer",
+		});
+		const entries = [{ role: "user" as const, content: "belongs only to explicit project A" }];
+		const session = makeFakeSession(settings, entries);
+		const stateA = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: { ...baseConfig, peerId: "project-a-peer", peerSource: "explicit", workspacePeer: true },
+			client: {} as OpenVikingApi,
+			session: session as never,
+		});
+		vi.spyOn(stateA, "flushAndCommit").mockRejectedValueOnce(new Error("unexpected old-scope flush failure"));
+		setOpenVikingSessionState(session as never, stateA);
+
+		try {
+			await settings.reloadForCwd(projectB);
+			await expect(openVikingBackend.stop?.({ session: session as never })).rejects.toThrow(
+				"source transcript tail was not flushed",
+			);
+
+			const configB = await loadOpenVikingConfig(settings);
+
+			expect(configB.peerSource).toBe("explicit");
+			expect(configB.peerId).toBe("project-a-peer");
+			expect(getOpenVikingSessionState(session as never)).toBeUndefined();
+			expect(session.customEntries).toEqual([]);
+		} finally {
+			await fs.rm(projectB, { recursive: true, force: true });
+		}
+	});
+
+	it("detaches the current backend when its transition cursor cannot be flushed", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: baseConfig,
+			client: {} as OpenVikingApi,
+			session: session as never,
+		});
+		vi.spyOn(state, "flushAndCommit").mockResolvedValueOnce(true);
+		session.sessionManager.flush = vi.fn(async () => {
+			throw new Error("cursor persistence failed");
+		});
+		setOpenVikingSessionState(session as never, state);
+
+		try {
+			await expect(openVikingBackend.stop?.({ session: session as never })).rejects.toThrow(
+				"cursor persistence failed",
+			);
+			expect(getOpenVikingSessionState(session as never)).toBeUndefined();
+		} finally {
+			setOpenVikingSessionState(session as never, undefined);
+			await state.dispose({ flush: false });
+		}
 	});
 
 	it("migrates a v3 cursor and resumes its pending extraction", async () => {

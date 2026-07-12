@@ -10,7 +10,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { openVikingBackend } from "@oh-my-pi/pi-coding-agent/openviking/backend";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { AgentSession, MemoryBackendWorkspaceTransition } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { removeWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
@@ -46,6 +46,8 @@ interface FakeAcpBuiltinSession {
 	getTodoPhases(): Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	setTodoPhases(phases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>): void;
 	waitForMemoryBackendReconcile(): Promise<void>;
+	suspendMemoryBackendForWorkspaceTransition(): Promise<MemoryBackendWorkspaceTransition | undefined>;
+	reconcileMemoryBackend(): Promise<void>;
 	refreshBaseSystemPrompt(): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
@@ -142,6 +144,10 @@ function createRuntime() {
 			this._todoPhases = phases;
 		},
 		async waitForMemoryBackendReconcile() {},
+		async suspendMemoryBackendForWorkspaceTransition() {
+			return undefined;
+		},
+		async reconcileMemoryBackend() {},
 		async refreshBaseSystemPrompt() {},
 		getAsyncJobSnapshot: () => null,
 		formatSessionAsText: () => "",
@@ -747,11 +753,23 @@ describe("wave 3 commands", () => {
 		expect(output[0]).toContain("does not exist");
 	});
 
+	it("/move: keeps a current-cwd no-op from suspending memory", async () => {
+		const { output, runtime, session } = createRuntime();
+		const suspend = spyOn(session, "suspendMemoryBackendForWorkspaceTransition");
+
+		const result = await executeAcpBuiltinSlashCommand("/move /tmp/project", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(suspend).not.toHaveBeenCalled();
+		expect(output).toEqual(["Already in /tmp/project."]);
+	});
+
 	it("/move: relocates the current session instead of switching to an empty target session", async () => {
 		const { output, runtime, session, fakeSessionManager } = createRuntime();
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		const originalProjectDir = process.cwd();
 		const reloadForCwd = spyOn(runtime.settings, "reloadForCwd");
+		const reconcileMemoryBackend = spyOn(session, "reconcileMemoryBackend");
 		let configNotified = 0;
 		runtime.notifyConfigChanged = () => {
 			configNotified++;
@@ -766,8 +784,56 @@ describe("wave 3 commands", () => {
 			expect(session._switchedTo).toBeUndefined();
 			expect(session._movedFromEmptySessionFile).toBeUndefined();
 			expect(reloadForCwd).toHaveBeenCalledWith(targetDir);
+			expect(reconcileMemoryBackend).toHaveBeenCalledTimes(1);
 			expect(configNotified).toBe(1);
 			expect(output[0]).toContain(`Moved to ${targetDir}.`);
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: leaves memory inactive after a partially applied session move", async () => {
+		const { output, runtime, session, fakeSessionManager } = createRuntime();
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		const originalProjectDir = process.cwd();
+		const completeOptions: Array<{ restart?: boolean } | undefined> = [];
+		const suspend = spyOn(session, "suspendMemoryBackendForWorkspaceTransition").mockResolvedValueOnce({
+			complete: async options => {
+				completeOptions.push(options);
+			},
+		});
+		spyOn(fakeSessionManager, "moveTo").mockImplementationOnce(async cwd => {
+			fakeSessionManager._cwd = cwd;
+			throw new Error("rewrite failed");
+		});
+
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(suspend).toHaveBeenCalledTimes(1);
+			expect(completeOptions).toEqual([{ restart: false }]);
+			expect(output).toContain("Move partially applied; memory remains inactive: rewrite failed");
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("/move: completes the cwd transition when memory backend rebuild fails closed", async () => {
+		const { output, runtime, session, fakeSessionManager } = createRuntime();
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		const originalProjectDir = process.cwd();
+		spyOn(session, "reconcileMemoryBackend").mockRejectedValue(new Error("peer baseline unavailable"));
+
+		try {
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(fakeSessionManager.getCwd()).toBe(targetDir);
+			expect(output).toContain("Memory backend reload failed after move: peer baseline unavailable");
+			expect(output).toContain(`Moved to ${targetDir}.`);
 		} finally {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });

@@ -1463,6 +1463,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				parentHindsightSessionState: this.session.getHindsightSessionState?.(),
 				parentMnemopiSessionState: this.session.getMnemopiSessionState?.(),
 				parentOpenVikingSessionState: this.session.getOpenVikingSessionState?.(),
+				parentTranscriptId: this.session.getSessionId?.() ?? undefined,
+				parentWorkspaceCwd: this.session.cwd,
 				parentTelemetry: this.session.getTelemetry?.(),
 				parentEvalSessionId,
 				parentAgentId: this.session.getAgentId?.() ?? MAIN_AGENT_ID,

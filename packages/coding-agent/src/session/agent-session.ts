@@ -658,8 +658,26 @@ export interface MemoryBackendReconciler {
 	depth: number;
 	parentSession(): AgentSession | undefined;
 	relatedSessions(): readonly AgentSession[];
+	suspend?(): Promise<void>;
 	stop(): Promise<void>;
 	start(options: { parentReconciled: boolean }): Promise<void>;
+}
+
+interface MemoryBackendParticipant {
+	session: AgentSession;
+	reconciler: MemoryBackendReconciler;
+}
+
+interface MemoryBackendTransitionGate {
+	participants: readonly MemoryBackendParticipant[];
+	completion: Promise<void>;
+	resolve(): void;
+	reject(error: unknown): void;
+	completing?: Promise<void>;
+}
+
+export interface MemoryBackendWorkspaceTransition {
+	complete(options?: { restart?: boolean }): Promise<void>;
 }
 
 type CompactionCheckResult = Readonly<{
@@ -3524,9 +3542,97 @@ export class AgentSession {
 
 	#memoryBackendReconciler: MemoryBackendReconciler | undefined;
 	#memoryBackendReconcileQueue: Promise<void> = Promise.resolve();
+	#memoryBackendTransition: MemoryBackendTransitionGate | undefined;
 
 	setMemoryBackendReconciler(reconciler: MemoryBackendReconciler | null): void {
 		this.#memoryBackendReconciler = reconciler ?? undefined;
+	}
+
+	static #memoryBackendParticipants(sessions: Iterable<AgentSession>): MemoryBackendParticipant[] {
+		return [...new Set(sessions)]
+			.map(session => ({ session, reconciler: session.#memoryBackendReconciler }))
+			.filter(
+				(entry): entry is MemoryBackendParticipant => !entry.session.#isDisposed && entry.reconciler !== undefined,
+			);
+	}
+
+	/**
+	 * Reserve every participant for a transcript/workspace mutation. Public
+	 * reconciles observed while the gate is held join its completion instead of
+	 * restarting a backend against half-applied session or cwd state.
+	 */
+	static async #beginMemoryBackendTransition(
+		sessions: Iterable<AgentSession>,
+	): Promise<MemoryBackendTransitionGate | undefined> {
+		const requestedSessions = [...new Set(sessions)];
+		while (true) {
+			const participants = AgentSession.#memoryBackendParticipants(requestedSessions);
+			if (participants.length === 0) return undefined;
+			const activeTransitions = [
+				...new Set(
+					participants
+						.map(entry => entry.session.#memoryBackendTransition)
+						.filter((transition): transition is MemoryBackendTransitionGate => transition !== undefined),
+				),
+			];
+			if (activeTransitions.length > 0) {
+				await Promise.all(activeTransitions.map(transition => transition.completion.catch(() => {})));
+				continue;
+			}
+
+			const completion = Promise.withResolvers<void>();
+			const transition: MemoryBackendTransitionGate = {
+				participants,
+				completion: completion.promise,
+				resolve: completion.resolve,
+				reject: completion.reject,
+			};
+			for (const { session } of participants) session.#memoryBackendTransition = transition;
+			return transition;
+		}
+	}
+
+	static #completeMemoryBackendTransition(transition: MemoryBackendTransitionGate, restart: boolean): Promise<void> {
+		if (!transition.completing) {
+			transition.completing = (async () => {
+				try {
+					if (restart) {
+						const sessions = new Set(transition.participants.map(entry => entry.session));
+						await AgentSession.reconcileMemoryBackends(sessions);
+					}
+				} finally {
+					for (const { session } of transition.participants) {
+						if (session.#memoryBackendTransition === transition) session.#memoryBackendTransition = undefined;
+					}
+				}
+			})();
+			void transition.completing.then(transition.resolve, transition.reject);
+		}
+		return transition.completion;
+	}
+
+	/** Queue a child-first stop-only barrier across a primary and every live alias. */
+	static #suspendMemoryBackends(sessions: Iterable<AgentSession>): Promise<void> {
+		const participants = AgentSession.#memoryBackendParticipants(sessions);
+		if (participants.length === 0) return Promise.resolve();
+		const depths = [...new Set(participants.map(entry => entry.reconciler.depth))].sort((a, b) => a - b);
+		const previous = Promise.all(participants.map(entry => entry.session.#memoryBackendReconcileQueue));
+		const result = previous.then(async () => {
+			const errors: unknown[] = [];
+			for (const depth of depths.toReversed()) {
+				const group = participants.filter(entry => entry.reconciler.depth === depth);
+				const outcomes = await Promise.allSettled(
+					group.map(entry => entry.reconciler.suspend?.() ?? entry.reconciler.stop()),
+				);
+				for (const outcome of outcomes) {
+					if (outcome.status === "rejected") errors.push(outcome.reason);
+				}
+			}
+			if (errors.length > 0) throw errors[0];
+		});
+		const settled = result.catch(() => {});
+		for (const { session } of participants) session.#memoryBackendReconcileQueue = settled;
+		return result;
 	}
 
 	/**
@@ -3535,12 +3641,7 @@ export class AgentSession {
 	 * starts run parent-first so aliases always bind to the replacement primary.
 	 */
 	static reconcileMemoryBackends(sessions: Iterable<AgentSession>): Promise<void> {
-		const participants = [...new Set(sessions)]
-			.map(session => ({ session, reconciler: session.#memoryBackendReconciler }))
-			.filter(
-				(entry): entry is { session: AgentSession; reconciler: MemoryBackendReconciler } =>
-					!entry.session.#isDisposed && entry.reconciler !== undefined,
-			);
+		const participants = AgentSession.#memoryBackendParticipants(sessions);
 		if (participants.length === 0) return Promise.resolve();
 
 		const participantSessions = new Set(participants.map(entry => entry.session));
@@ -3586,12 +3687,63 @@ export class AgentSession {
 	reconcileMemoryBackend(): Promise<void> {
 		const reconciler = this.#memoryBackendReconciler;
 		if (!reconciler || this.#isDisposed) return Promise.resolve();
-		return AgentSession.reconcileMemoryBackends([this, ...reconciler.relatedSessions()]);
+		const sessions = [...new Set([this, ...reconciler.relatedSessions()])];
+		const activeTransitions = [
+			...new Set(
+				sessions
+					.map(session => session.#memoryBackendTransition)
+					.filter((transition): transition is MemoryBackendTransitionGate => transition !== undefined),
+			),
+		];
+		if (activeTransitions.length > 0) {
+			return Promise.all(activeTransitions.map(transition => transition.completion)).then(() => {});
+		}
+		return AgentSession.reconcileMemoryBackends(sessions);
 	}
 
 	/** Wait until the latest reconcile settles; UI callers receive its error separately. */
 	waitForMemoryBackendReconcile(): Promise<void> {
-		return this.#memoryBackendReconcileQueue;
+		const transition = this.#memoryBackendTransition;
+		return transition
+			? Promise.all([this.#memoryBackendReconcileQueue, transition.completion]).then(() => {})
+			: this.#memoryBackendReconcileQueue;
+	}
+
+	/**
+	 * Flush and stop OpenViking before a cwd mutation. Live child aliases keep
+	 * running work bound to the old workspace, so moving their parent is refused
+	 * instead of rebinding in-flight output to the destination peer.
+	 */
+	async suspendMemoryBackendForWorkspaceTransition(): Promise<MemoryBackendWorkspaceTransition | undefined> {
+		await this.waitForMemoryBackendReconcile();
+		const reconciler = this.#memoryBackendReconciler;
+		const sessions = [...new Set(reconciler ? [this, ...reconciler.relatedSessions()] : [this])];
+		if (sessions.some(session => session !== this && session.getOpenVikingSessionState())) {
+			throw new Error("Cannot move the session while an OpenViking child agent is still active.");
+		}
+		if (!reconciler) throw new Error("Cannot safely suspend OpenViking before changing workspace.");
+		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
+			throw new Error("Cannot move because the current OpenViking transcript tail could not be flushed.");
+		}
+		const transition = await AgentSession.#beginMemoryBackendTransition(sessions);
+		if (!transition) throw new Error("Cannot safely reserve OpenViking before changing workspace.");
+		try {
+			await AgentSession.#suspendMemoryBackends(sessions);
+			return {
+				complete: async options => {
+					await AgentSession.#completeMemoryBackendTransition(transition, options?.restart ?? true);
+				},
+			};
+		} catch (error) {
+			try {
+				await AgentSession.#completeMemoryBackendTransition(transition, true);
+			} catch (restartError) {
+				logger.warn("OpenViking: failed to restore the backend after workspace suspension failed", {
+					error: String(restartError),
+				});
+			}
+			throw error;
+		}
 	}
 
 	/** Provider-scoped mutable state store for transport/session caches. */
@@ -6252,7 +6404,7 @@ export class AgentSession {
 
 	async #rekeyOpenVikingMemoryForCurrentSessionId(baselineExistingTranscript = false): Promise<void> {
 		if (this.settings.get("memory.backend") !== "openviking") return;
-		const sid = this.agent.sessionId;
+		const sid = this.sessionManager.getSessionId();
 		if (!sid) return;
 		await this.getOpenVikingSessionState()?.rekeySession(sid, { baselineExistingTranscript });
 	}
@@ -6689,7 +6841,10 @@ export class AgentSession {
 	}
 
 	/** Replace only session-owned, backend-dependent built-ins. */
-	async refreshMemoryTools(memoryTools: AgentTool[], options: { forceActive?: Iterable<string> } = {}): Promise<void> {
+	async refreshMemoryTools(
+		memoryTools: AgentTool[],
+		options: { forceActive?: Iterable<string>; rebuildSystemPrompt?: boolean } = {},
+	): Promise<void> {
 		const previousInstalled = new Set(this.#installedMemoryBuiltinToolNames);
 		const nextActive = this.getActiveToolNames().filter(name => !previousInstalled.has(name));
 
@@ -6718,7 +6873,9 @@ export class AgentSession {
 				nextActive.push(tool.name);
 			}
 		}
-		await this.#applyActiveToolsByName([...new Set(nextActive)]);
+		await this.#applyActiveToolsByName([...new Set(nextActive)], {
+			rebuildSystemPrompt: options.rebuildSystemPrompt,
+		});
 	}
 
 	/** Removes tools installed by {@link activateVibeTools} and activates `nextToolNames`. */
@@ -6883,7 +7040,10 @@ export class AgentSession {
 		);
 	}
 
-	async #applyActiveToolsByName(toolNames: string[]): Promise<void> {
+	async #applyActiveToolsByName(
+		toolNames: string[],
+		options?: { rebuildSystemPrompt?: boolean },
+	): Promise<void> {
 		toolNames = normalizeToolNames(toolNames);
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
@@ -6914,7 +7074,7 @@ export class AgentSession {
 		// `refreshMCPTools` -> `#applyActiveToolsByName` even though the resulting
 		// tool list is byte-identical. Skipping the rebuild keeps the system prompt
 		// stable, which is required for Anthropic prompt caching to keep hitting.
-		if (this.#rebuildSystemPrompt) {
+		if (this.#rebuildSystemPrompt && options?.rebuildSystemPrompt !== false) {
 			const signature = this.#computeAppliedToolSignature(validToolNames, tools);
 			if (signature !== this.#lastAppliedToolSignature) {
 				if (this.#lastAppliedToolSignature !== undefined) {
@@ -6969,6 +7129,31 @@ export class AgentSession {
 			.map(name => this.#toolRegistry.get(name))
 			.filter((tool): tool is AgentTool => tool != null);
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
+	}
+
+	/** Remove a previously rendered backend fragment when a full prompt rebuild fails. */
+	removeBaseSystemPromptFragment(fragment: string): boolean {
+		if (!fragment) return false;
+		let changed = false;
+		const strip = (parts: string[]): string[] =>
+			parts
+				.map(part => {
+					if (!part.includes(fragment)) return part;
+					changed = true;
+					return part.replaceAll(fragment, "").replace(/\n{3,}/g, "\n\n");
+				})
+				.filter(part => part.length > 0);
+		const nextBaseSystemPrompt = strip(this.#baseSystemPrompt);
+		const nextBeforeMemoryPromotion = this.#baseSystemPromptBeforeMemoryPromotion
+			? strip(this.#baseSystemPromptBeforeMemoryPromotion)
+			: undefined;
+		if (!changed) return false;
+		this.#promptRebuildGeneration++;
+		this.#baseSystemPrompt = nextBaseSystemPrompt;
+		this.#baseSystemPromptBeforeMemoryPromotion = nextBeforeMemoryPromotion;
+		this.#clearInheritedProviderPromptCacheKey();
+		this.agent.setSystemPrompt(this.#baseSystemPrompt);
+		return true;
 	}
 
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
@@ -15497,7 +15682,11 @@ export class AgentSession {
 	 */
 	async switchSession(sessionPath: string): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
-		const switchingToDifferentSession = previousSessionFile
+		const previousSessionId = this.sessionManager.getSessionId();
+		const previousSessionCwd = this.sessionManager.getCwd();
+		const reloadingCurrentSessionFile =
+			previousSessionFile !== undefined && path.resolve(previousSessionFile) === path.resolve(sessionPath);
+		let switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
 			: true;
 		// Emit session_before_switch event (can be cancelled)
@@ -15522,6 +15711,64 @@ export class AgentSession {
 		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
 			this.#reconnectToAgent();
 			return false;
+		}
+		const targetIdentity = await this.sessionManager.inspectSessionFileIdentity(sessionPath);
+		if (
+			!targetIdentity ||
+			targetIdentity.id !== previousSessionId ||
+			(targetIdentity.cwd !== undefined && path.resolve(targetIdentity.cwd) !== path.resolve(previousSessionCwd))
+		) {
+			switchingToDifferentSession = true;
+		}
+		let suspendedOpenViking = false;
+		let memoryTransition: MemoryBackendTransitionGate | undefined;
+		const memoryReconciler = this.#memoryBackendReconciler;
+		const relatedMemorySessions = memoryReconciler ? [this, ...memoryReconciler.relatedSessions()] : [this];
+		const requiresMemorySuspension = switchingToDifferentSession || reloadingCurrentSessionFile;
+		if (
+			requiresMemorySuspension &&
+			relatedMemorySessions.some(session => session !== this && session.getOpenVikingSessionState())
+		) {
+			logger.warn("OpenViking: session switch cancelled while a child memory alias is active", {
+				targetSessionFile: sessionPath,
+			});
+			this.#reconnectToAgent();
+			return false;
+		}
+		if (
+			requiresMemorySuspension &&
+			!memoryReconciler &&
+			relatedMemorySessions.some(session => session.getOpenVikingSessionState())
+		) {
+			logger.warn("OpenViking: cannot safely suspend the active backend before switching sessions");
+			this.#reconnectToAgent();
+			return false;
+		}
+		if (requiresMemorySuspension && memoryReconciler) {
+			try {
+				memoryTransition = await AgentSession.#beginMemoryBackendTransition(relatedMemorySessions);
+				if (!memoryTransition) {
+					throw new Error("OpenViking transition participants are no longer available.");
+				}
+				await AgentSession.#suspendMemoryBackends(relatedMemorySessions);
+				suspendedOpenViking = true;
+			} catch (error) {
+				logger.warn("OpenViking: backend suspension failed before switching sessions", {
+					targetSessionFile: sessionPath,
+					error: String(error),
+				});
+				if (memoryTransition) {
+					try {
+						await AgentSession.#completeMemoryBackendTransition(memoryTransition, true);
+					} catch (restartError) {
+						logger.warn("OpenViking: failed to restore the backend after session suspension failed", {
+							error: String(restartError),
+						});
+					}
+				}
+				this.#reconnectToAgent();
+				return false;
+			}
 		}
 		const previousSessionState = this.sessionManager.captureState();
 		// Only same-session reloads compare against the prior context to detect
@@ -15583,15 +15830,6 @@ export class AgentSession {
 				previousSessionContext !== undefined &&
 				this.#didSessionMessagesChange(previousSessionContext.messages, sessionContext.messages);
 			this.#rehydrateCheckpointRewindState();
-
-			// Emit session_switch event to hooks
-			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "resume",
-					previousSessionFile,
-				});
-			}
 
 			this.agent.replaceMessages(sessionContext.messages);
 			this.#resetAdvisorSessionState();
@@ -15693,6 +15931,60 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				await this.#resetMemoryContextForNewTranscript();
 			}
+			const effectiveSessionCwd = this.sessionManager.getCwd();
+			const switchedAcrossCwd = path.resolve(previousSessionCwd) !== path.resolve(effectiveSessionCwd);
+			const declaredSessionCwd = this.sessionManager.getHeader()?.cwd;
+			const unappliedDeclaredCwd =
+				declaredSessionCwd && path.resolve(declaredSessionCwd) !== path.resolve(effectiveSessionCwd)
+					? declaredSessionCwd
+					: undefined;
+			const transitionFromCwd =
+				unappliedDeclaredCwd ??
+				(switchedAcrossCwd && previousSessionId === this.sessionManager.getSessionId()
+					? previousSessionCwd
+					: undefined);
+			if (transitionFromCwd) {
+				this.sessionManager.recordCwdTransition(transitionFromCwd, effectiveSessionCwd);
+				await this.sessionManager.flush();
+			}
+			let destinationSettingsReady = true;
+			if (switchedAcrossCwd) {
+				try {
+					await this.settings.reloadForCwd(this.sessionManager.getCwd());
+				} catch (error) {
+					destinationSettingsReady = false;
+					logger.warn("Failed to reload destination settings after session switch", {
+						cwd: this.sessionManager.getCwd(),
+						error: String(error),
+					});
+				}
+			}
+			if (memoryTransition && !destinationSettingsReady) {
+				await AgentSession.#completeMemoryBackendTransition(memoryTransition, false);
+			} else if ((suspendedOpenViking || switchedAcrossCwd) && destinationSettingsReady) {
+				try {
+					if (memoryTransition) {
+						await AgentSession.#completeMemoryBackendTransition(memoryTransition, true);
+					} else {
+						await this.reconcileMemoryBackend();
+					}
+				} catch (error) {
+					logger.warn("Memory backend restart failed after session switch; continuing with inert memory", {
+						targetSessionFile: sessionPath,
+						error: String(error),
+					});
+				}
+			}
+			// The transition gate must be released before invoking external hooks:
+			// session_switch handlers may await memory.status/search/save, which in
+			// turn wait for the gate and would otherwise deadlock this switch.
+			if (this.#extensionRunner) {
+				await this.#extensionRunner.emit({
+					type: "session_switch",
+					reason: "resume",
+					previousSessionFile,
+				});
+			}
 			this.#reconnectToAgent();
 			try {
 				await this.#sessionSwitchReconciler?.();
@@ -15733,6 +16025,15 @@ export class AgentSession {
 			this.#serviceTierByFamily = previousServiceTierByFamily;
 			this.#syncTodoPhasesFromBranch();
 			this.#resetAllAdvisorRuntimes();
+			if (memoryTransition) {
+				try {
+					await AgentSession.#completeMemoryBackendTransition(memoryTransition, true);
+				} catch (restartError) {
+					logger.warn("OpenViking: failed to restore the previous backend after session switch rollback", {
+						error: String(restartError),
+					});
+				}
+			}
 			this.#reconnectToAgent();
 			throw error;
 		}

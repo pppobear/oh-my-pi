@@ -2775,8 +2775,35 @@ export const SETTINGS_SCHEMA = {
 			tab: "memory",
 			group: "OpenViking",
 			label: "OpenViking Peer ID",
-			description: "Optional peer id sent with retained messages. Leave empty for server defaults.",
+			description: "Optional peer id sent with retained messages. Overrides the workspace-derived peer.",
 			condition: "openvikingActive",
+		},
+	},
+	"openviking.workspacePeer": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Workspace Peer",
+			description: "Derive a stable peer id from the project path to scope recall and retained memories",
+			condition: "openvikingActive",
+		},
+	},
+	"openviking.recallPeerScope": {
+		type: "enum",
+		values: ["actor", "all"] as const,
+		default: "actor",
+		ui: {
+			tab: "memory",
+			group: "OpenViking",
+			label: "OpenViking Recall Peer Scope",
+			description: "Choose whether recall is limited to global plus the current peer, or includes other peers",
+			condition: "openvikingActive",
+			options: [
+				{ value: "actor", label: "Current Peer", description: "Recall global and current-project memories only" },
+				{ value: "all", label: "All Peers", description: "Also recall penalized memories from other projects" },
+			],
 		},
 	},
 	"openviking.autoRecall": {

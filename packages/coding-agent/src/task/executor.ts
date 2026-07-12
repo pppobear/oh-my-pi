@@ -365,6 +365,10 @@ export interface ExecutorOptions {
 	parentHindsightSessionState?: HindsightSessionState;
 	parentMnemopiSessionState?: MnemopiSessionState;
 	parentOpenVikingSessionState?: OpenVikingSessionState;
+	/** Parent AgentSession transcript id captured when this child was created. */
+	parentTranscriptId?: string;
+	/** Parent workspace captured with the transcript pin. */
+	parentWorkspaceCwd?: string;
 	/** Parent agent's eval executor session id. Subagents reuse it so eval state is shared. */
 	parentEvalSessionId?: string;
 	/**
@@ -2442,6 +2446,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				parentHindsightSessionState: options.parentHindsightSessionState,
 				parentMnemopiSessionState: options.parentMnemopiSessionState,
 				parentOpenVikingSessionState: options.parentOpenVikingSessionState,
+				parentTranscriptId: options.parentTranscriptId,
+				parentWorkspaceCwd: options.parentWorkspaceCwd,
 				parentTaskPrefix: id,
 				parentAgentId: options.parentAgentId,
 				agentId: id,
@@ -2523,6 +2529,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				tools: session.getActiveToolNames(),
 				spawns: spawnsEnv,
 				readSummarize: agent.readSummarize,
+				parentTranscriptId: options.parentTranscriptId,
+				parentWorkspaceCwd: options.parentWorkspaceCwd,
 				outputSchema,
 			});
 

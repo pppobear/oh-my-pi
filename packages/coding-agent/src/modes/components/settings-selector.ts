@@ -946,6 +946,10 @@ export class SettingsSelectorComponent implements Component {
 				return config.userId ?? "";
 			case "openviking.peerId":
 				return config.peerId ?? "";
+			case "openviking.workspacePeer":
+				return String(config.workspacePeer);
+			case "openviking.recallPeerScope":
+				return config.recallPeerScope;
 			case "openviking.autoRecall":
 				return String(config.autoRecall);
 			case "openviking.autoRetain":

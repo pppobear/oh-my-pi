@@ -10,6 +10,9 @@ export interface OpenVikingConfig {
 	accountId: string | null;
 	userId: string | null;
 	peerId: string | null;
+	peerSource: "explicit" | "workspace" | "none";
+	workspacePeer: boolean;
+	recallPeerScope: "actor" | "all";
 	timeoutMs: number;
 	captureTimeoutMs: number;
 	autoRecall: boolean;
@@ -30,7 +33,35 @@ interface OpenVikingCliConfigFile {
 	url?: unknown;
 	api_key?: unknown;
 	account?: unknown;
+	account_id?: unknown;
 	user?: unknown;
+	user_id?: unknown;
+	actor_peer_id?: unknown;
+	peer_id?: unknown;
+}
+
+interface OpenVikingHarnessConfig {
+	apiKey?: unknown;
+	accountId?: unknown;
+	userId?: unknown;
+	peerId?: unknown;
+	peer_id?: unknown;
+	workspacePeer?: unknown;
+	recallPeerScope?: unknown;
+	timeoutMs?: unknown;
+	captureTimeoutMs?: unknown;
+	autoRecall?: unknown;
+	autoCapture?: unknown;
+	recallLimit?: unknown;
+	scoreThreshold?: unknown;
+	minQueryLength?: unknown;
+	recallMaxContentChars?: unknown;
+	recallTokenBudget?: unknown;
+	recallPreferAbstract?: unknown;
+	recallContextTurns?: unknown;
+	captureAssistantTurns?: unknown;
+	commitEveryNTurns?: unknown;
+	debug?: unknown;
 }
 
 interface OpenVikingLegacyConfigFile {
@@ -40,27 +71,8 @@ interface OpenVikingLegacyConfigFile {
 		port?: unknown;
 		root_api_key?: unknown;
 	};
-	claude_code?: {
-		apiKey?: unknown;
-		accountId?: unknown;
-		userId?: unknown;
-		peerId?: unknown;
-		peer_id?: unknown;
-		timeoutMs?: unknown;
-		captureTimeoutMs?: unknown;
-		autoRecall?: unknown;
-		autoCapture?: unknown;
-		recallLimit?: unknown;
-		scoreThreshold?: unknown;
-		minQueryLength?: unknown;
-		recallMaxContentChars?: unknown;
-		recallTokenBudget?: unknown;
-		recallPreferAbstract?: unknown;
-		recallContextTurns?: unknown;
-		captureAssistantTurns?: unknown;
-		commitEveryNTurns?: unknown;
-		debug?: unknown;
-	};
+	codex?: OpenVikingHarnessConfig;
+	claude_code?: OpenVikingHarnessConfig;
 }
 
 interface OpenVikingConnectionProfile {
@@ -91,13 +103,25 @@ function envString(env: NodeJS.ProcessEnv, ...names: string[]): string | undefin
 	return undefined;
 }
 
+function credentialSourceFromEnvironment(env: NodeJS.ProcessEnv): "auto" | "env" | "cli" {
+	const source = envString(env, "OPENVIKING_CREDENTIAL_SOURCE", "OPENVIKING_CREDENTIALS_SOURCE")?.toLowerCase();
+	if (source === "env" || source === "environment") return "env";
+	if (source === "cli" || source === "ovcli" || source === "file" || source === "config") return "cli";
+	return "auto";
+}
+
 function boolFromUnknown(value: unknown): boolean | undefined {
 	if (typeof value === "boolean") return value;
 	if (typeof value !== "string" || value.trim() === "") return undefined;
 	const lower = value.trim().toLowerCase();
-	if (lower === "0" || lower === "false" || lower === "no") return false;
-	if (lower === "1" || lower === "true" || lower === "yes") return true;
+	if (lower === "0" || lower === "false" || lower === "no" || lower === "off") return false;
+	if (lower === "1" || lower === "true" || lower === "yes" || lower === "on") return true;
 	return undefined;
+}
+
+function recallPeerScopeFromUnknown(value: unknown): "actor" | "all" | undefined {
+	const normalized = asString(value)?.toLowerCase();
+	return normalized === "actor" || normalized === "all" ? normalized : undefined;
 }
 
 function finiteNumberFromUnknown(value: unknown): number | undefined {
@@ -146,6 +170,11 @@ const OPENVIKING_ENVIRONMENT_SETTINGS: Partial<Record<SettingPath, OpenVikingEnv
 	"openviking.account": { names: ["OPENVIKING_ACCOUNT"], parse: asString },
 	"openviking.user": { names: ["OPENVIKING_USER"], parse: asString },
 	"openviking.peerId": { names: ["OPENVIKING_PEER_ID"], parse: asString },
+	"openviking.workspacePeer": { names: ["OPENVIKING_WORKSPACE_PEER"], parse: boolFromUnknown },
+	"openviking.recallPeerScope": {
+		names: ["OPENVIKING_RECALL_PEER_SCOPE"],
+		parse: recallPeerScopeFromUnknown,
+	},
 	"openviking.autoRecall": { names: ["OPENVIKING_AUTO_RECALL"], parse: boolFromUnknown },
 	"openviking.autoRetain": { names: ["OPENVIKING_AUTO_CAPTURE"], parse: boolFromUnknown },
 	"openviking.recallLimit": { names: ["OPENVIKING_RECALL_LIMIT"], parse: finiteNumberFromUnknown },
@@ -228,38 +257,82 @@ function baseUrlFromLegacyServer(server: OpenVikingLegacyConfigFile["server"]): 
 	return `http://${host}:${port}`;
 }
 
+function hasOpenVikingCliProfile(config: OpenVikingCliConfigFile | null): config is OpenVikingCliConfigFile {
+	if (!config) return false;
+	return [
+		config.url,
+		config.api_key,
+		config.account,
+		config.account_id,
+		config.user,
+		config.user_id,
+		config.actor_peer_id,
+		config.peer_id,
+	].some(value => asString(value) !== undefined);
+}
+
+function looksLikeOpenVikingCliConfig(value: unknown): value is OpenVikingCliConfigFile {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	if (record.server && typeof record.server === "object") return false;
+	return ["url", "api_key", "account", "account_id", "user", "user_id", "actor_peer_id", "peer_id"].some(
+		key => asString(record[key]) !== undefined,
+	);
+}
+
+export function deriveOpenVikingWorkspacePeerId(cwd: string): string {
+	return cwd.replace(/[^A-Za-z0-9]/g, "-");
+}
+
 export async function loadOpenVikingConfig(
 	settings: Settings,
 	env: NodeJS.ProcessEnv = process.env,
 ): Promise<OpenVikingConfig> {
-	const ovConfPath = envString(env, "OPENVIKING_CONFIG_FILE") ?? DEFAULT_OV_CONF_PATH;
-	const ovCliConfPath = envString(env, "OPENVIKING_CLI_CONFIG_FILE") ?? DEFAULT_OVCLI_CONF_PATH;
-	const [legacy, cli] = await Promise.all([
+	const configuredOvConfPath = envString(env, "OPENVIKING_CONFIG_FILE");
+	const configuredOvCliConfPath = envString(env, "OPENVIKING_CLI_CONFIG_FILE");
+	const ovConfPath = configuredOvConfPath ?? DEFAULT_OV_CONF_PATH;
+	const ovCliConfPath = configuredOvCliConfPath ?? DEFAULT_OVCLI_CONF_PATH;
+	let [legacy, cli] = await Promise.all([
 		readJsonFile<OpenVikingLegacyConfigFile>(ovConfPath),
 		readJsonFile<OpenVikingCliConfigFile>(ovCliConfPath),
 	]);
+	// Older official plugin installs used OPENVIKING_CONFIG_FILE for both
+	// ov.conf and ovcli.conf. An explicitly configured ovcli-shaped file must
+	// remain the authoritative CLI profile when no dedicated CLI path is set.
+	if (configuredOvConfPath && !configuredOvCliConfPath && looksLikeOpenVikingCliConfig(legacy)) {
+		cli = legacy;
+		legacy = null;
+	}
 	const server = legacy?.server;
-	const cc = legacy?.claude_code;
+	const cc = legacy?.codex || legacy?.claude_code ? { ...legacy?.claude_code, ...legacy?.codex } : undefined;
+	const harnessPeerId =
+		asString(legacy?.codex?.peerId) ??
+		asString(legacy?.codex?.peer_id) ??
+		asString(legacy?.claude_code?.peerId) ??
+		asString(legacy?.claude_code?.peer_id);
 	const cliBaseUrl = asString(cli?.url)?.replace(/\/+$/, "");
-	const cliProfile: OpenVikingConnectionProfile | null = cliBaseUrl
-		? {
-				baseUrl: cliBaseUrl,
-				apiKey: asString(cli?.api_key),
-				accountId: asString(cli?.account),
-				userId: asString(cli?.user),
-			}
-		: null;
 	const legacyProfile: OpenVikingConnectionProfile | null = legacy
 		? {
 				baseUrl: server ? baseUrlFromLegacyServer(server) : DEFAULT_BASE_URL,
 				apiKey: asString(cc?.apiKey) ?? asString(server?.root_api_key),
 				accountId: asString(cc?.accountId),
 				userId: asString(cc?.userId),
-				peerId: asString(cc?.peerId) ?? asString(cc?.peer_id),
+				peerId: harnessPeerId,
 			}
 		: null;
+	const cliConnectionProfile: OpenVikingConnectionProfile = {
+		baseUrl: cliBaseUrl ?? legacyProfile?.baseUrl ?? DEFAULT_BASE_URL,
+		apiKey: asString(cli?.api_key),
+		accountId: asString(cli?.account) ?? asString(cli?.account_id),
+		userId: asString(cli?.user) ?? asString(cli?.user_id),
+		peerId: asString(cli?.actor_peer_id) ?? asString(cli?.peer_id),
+	};
+	const cliProfile: OpenVikingConnectionProfile | null = hasOpenVikingCliProfile(cli) ? cliConnectionProfile : null;
+	const credentialSource = credentialSourceFromEnvironment(env);
+	const allowEnvironmentCredentials = credentialSource !== "cli";
 	const explicitBaseUrl =
-		openVikingEnvironmentString("openviking.apiUrl", env) ?? configuredStringSetting(settings, "openviking.apiUrl");
+		(allowEnvironmentCredentials ? openVikingEnvironmentString("openviking.apiUrl", env) : undefined) ??
+		configuredStringSetting(settings, "openviking.apiUrl");
 	// Treat discovered connection details as an atomic profile. In particular,
 	// never pair an ovcli URL with ov.conf's server root key. An explicit OMP or
 	// environment credential remains a deliberate override for any URL. Keep a
@@ -267,7 +340,23 @@ export async function loadOpenVikingConfig(
 	// this makes a no-op Settings edit preserve the matching profile credential
 	// without ever carrying it to a different origin.
 	const normalizedExplicitBaseUrl = explicitBaseUrl?.replace(/\/+$/, "");
-	const officialProfile = cliProfile ?? legacyProfile;
+	// The official env mode ignores the CLI URL but still falls back to ovcli
+	// identity fields when their environment counterparts are absent. Keep that
+	// behavior even when ov.conf does not exist; the connection then uses the
+	// default local server instead of silently dropping the CLI credential.
+	const environmentProfile: OpenVikingConnectionProfile = {
+		baseUrl: legacyProfile?.baseUrl ?? DEFAULT_BASE_URL,
+		apiKey: cliProfile?.apiKey ?? legacyProfile?.apiKey,
+		accountId: cliProfile?.accountId ?? legacyProfile?.accountId,
+		userId: cliProfile?.userId ?? legacyProfile?.userId,
+		peerId: cliProfile?.peerId ?? legacyProfile?.peerId,
+	};
+	const officialProfile =
+		credentialSource === "cli"
+			? cliConnectionProfile
+			: credentialSource === "env"
+				? environmentProfile
+				: (cliProfile ?? legacyProfile);
 	const discoveredProfile =
 		normalizedExplicitBaseUrl && officialProfile?.baseUrl !== normalizedExplicitBaseUrl ? null : officialProfile;
 	const baseUrl = normalizedExplicitBaseUrl ?? discoveredProfile?.baseUrl ?? DEFAULT_BASE_URL;
@@ -284,29 +373,41 @@ export async function loadOpenVikingConfig(
 		Math.max(timeoutMs * 2, 30_000),
 		1_000,
 	);
+	const explicitPeerId =
+		(allowEnvironmentCredentials ? openVikingEnvironmentString("openviking.peerId", env) : undefined) ??
+		configuredStringSetting(settings, "openviking.peerId") ??
+		discoveredProfile?.peerId;
+	const workspacePeer =
+		openVikingEnvironmentBoolean("openviking.workspacePeer", env) ??
+		resolveConfigValue(configuredSetting(settings, "openviking.workspacePeer"), boolFromUnknown(cc?.workspacePeer)) ??
+		true;
+	const peerId = explicitPeerId ?? (workspacePeer ? deriveOpenVikingWorkspacePeerId(settings.getCwd()) : null);
 
 	return {
 		baseUrl,
 		apiKey:
-			openVikingEnvironmentString("openviking.apiKey", env) ??
+			(allowEnvironmentCredentials ? openVikingEnvironmentString("openviking.apiKey", env) : undefined) ??
 			configuredStringSetting(settings, "openviking.apiKey") ??
 			discoveredProfile?.apiKey ??
 			null,
 		accountId:
-			openVikingEnvironmentString("openviking.account", env) ??
+			(allowEnvironmentCredentials ? openVikingEnvironmentString("openviking.account", env) : undefined) ??
 			configuredStringSetting(settings, "openviking.account") ??
 			discoveredProfile?.accountId ??
 			null,
 		userId:
-			openVikingEnvironmentString("openviking.user", env) ??
+			(allowEnvironmentCredentials ? openVikingEnvironmentString("openviking.user", env) : undefined) ??
 			configuredStringSetting(settings, "openviking.user") ??
 			discoveredProfile?.userId ??
 			null,
-		peerId:
-			openVikingEnvironmentString("openviking.peerId", env) ??
-			configuredStringSetting(settings, "openviking.peerId") ??
-			discoveredProfile?.peerId ??
-			null,
+		peerId,
+		peerSource: explicitPeerId ? "explicit" : peerId ? "workspace" : "none",
+		workspacePeer,
+		recallPeerScope:
+			recallPeerScopeFromUnknown(openVikingEnvironmentString("openviking.recallPeerScope", env)) ??
+			configuredSetting(settings, "openviking.recallPeerScope") ??
+			recallPeerScopeFromUnknown(cc?.recallPeerScope) ??
+			"actor",
 		timeoutMs,
 		captureTimeoutMs,
 		autoRecall:

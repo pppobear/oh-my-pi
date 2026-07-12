@@ -69,7 +69,7 @@ export class MemoryRetainTool implements AgentTool<typeof memoryRetainSchema> {
 		if (backend === "openviking") {
 			const state = this.session.getOpenVikingSessionState?.();
 			const primary = state?.aliasOf ?? state;
-			if (!primary) {
+			if (!state?.isReady || !primary) {
 				throw new Error("OpenViking backend is not initialised for this session.");
 			}
 			const outcome = await primary.saveMany(params.items);

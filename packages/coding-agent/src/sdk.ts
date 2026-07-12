@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import {
 	Agent,
 	type AgentEvent,
@@ -96,6 +97,7 @@ import {
 import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } from "./mcp/startup-events";
 import { createSessionMemoryRuntimeContext, type MemoryBackend, resolveMemoryBackend } from "./memory-backend";
 import type { MnemopiSessionState } from "./mnemopi/state";
+import { OPENVIKING_DEVELOPER_INSTRUCTIONS } from "./openviking/backend";
 import type { OpenVikingSessionState } from "./openviking/state";
 import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
@@ -498,6 +500,15 @@ export interface CreateAgentSessionOptions {
 	parentMnemopiSessionState?: MnemopiSessionState;
 	/** Parent OpenViking state to alias for subagent memory tools. */
 	parentOpenVikingSessionState?: OpenVikingSessionState;
+	/**
+	 * Parent transcript identity captured when this subagent was created.
+	 * `null` means a revived legacy transcript has no trustworthy parent pin and
+	 * must keep OpenViking inactive; omitted lets direct SDK callers sample a
+	 * currently live parent once during initial construction.
+	 */
+	parentTranscriptId?: string | null;
+	/** Parent workspace captured with the transcript pin; `null` is an untrusted legacy revival. */
+	parentWorkspaceCwd?: string | null;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
@@ -514,6 +525,8 @@ export interface CreateAgentSessionOptions {
 	 * top-level "Main" session, which has no parent.
 	 */
 	parentAgentId?: string;
+	/** Explicit live memory ownership group. Task children normally inherit their registry parent's group. */
+	memoryBackendGroupId?: string;
 	/** Inherited eval executor session id for subagents sharing parent eval state. */
 	parentEvalSessionId?: string;
 
@@ -1515,6 +1528,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const resolvedAgentDisplayName =
 		options.agentDisplayName ?? ((options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? "sub" : "main");
 	const agentKind = (options.taskDepth ?? 0) > 0 || options.parentTaskPrefix ? ("sub" as const) : ("main" as const);
+	const memoryBackendGroupId =
+		options.memoryBackendGroupId ??
+		((options.taskDepth ?? 0) > 0 && options.parentAgentId
+			? (agentRegistry.get(options.parentAgentId)?.memoryBackendGroupId ?? options.parentAgentId)
+			: resolvedAgentId);
 	/**
 	 * Forget the agent ref on teardown — unless the agent is being parked (or is
 	 * already parked). Parking disposes the session but keeps the ref addressable
@@ -2450,6 +2468,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			displayName: resolvedAgentDisplayName,
 			kind: agentKind,
 			parentId: options.parentAgentId,
+			memoryBackendGroupId,
 			session: null,
 			sessionFile: sessionManager.getSessionFile() ?? null,
 			status: "running",
@@ -2918,6 +2937,52 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let appliedMemoryBackend: MemoryBackend | undefined;
 		const liveParentSession = () =>
 			options.parentAgentId ? (agentRegistry.get(options.parentAgentId)?.session ?? undefined) : undefined;
+		const initialParentSessionId =
+			options.parentTranscriptId === null
+				? null
+				: (options.parentTranscriptId ??
+					options.parentOpenVikingSessionState?.session.sessionManager.getSessionId() ??
+					liveParentSession()?.sessionManager.getSessionId());
+		const initialParentWorkspaceCwd =
+			options.parentWorkspaceCwd === null
+				? null
+				: (options.parentWorkspaceCwd ??
+					options.parentOpenVikingSessionState?.session.sessionManager.getCwd() ??
+					liveParentSession()?.sessionManager.getCwd());
+		const openVikingParentTranscriptIsCurrent = () => {
+			if (taskDepth === 0) return true;
+			if (initialParentSessionId === null || initialParentWorkspaceCwd === null) return false;
+			const parentSession = liveParentSession();
+			if (parentSession) {
+				const parentState = parentSession.getOpenVikingSessionState();
+				return (
+					parentSession.sessionManager.getSessionId() === initialParentSessionId &&
+					initialParentWorkspaceCwd !== undefined &&
+					path.resolve(parentSession.sessionManager.getCwd()) === path.resolve(initialParentWorkspaceCwd) &&
+					parentState?.isReady === true
+				);
+			}
+			const fallbackParentState = options.parentOpenVikingSessionState;
+			if (!fallbackParentState?.isReady) return false;
+			return (
+				fallbackParentState.session.sessionManager.getSessionId() === initialParentSessionId &&
+				initialParentWorkspaceCwd !== undefined &&
+				path.resolve(fallbackParentState.session.sessionManager.getCwd()) ===
+					path.resolve(initialParentWorkspaceCwd)
+			);
+		};
+		const alignChildMemoryBackendSelection = () => {
+			const parentSession = taskDepth > 0 ? liveParentSession() : undefined;
+			if (parentSession) settings.set("memory.backend", parentSession.settings.get("memory.backend"));
+		};
+		const relatedMemorySessions = (): AgentSession[] => {
+			const sessions = new Set([session]);
+			for (const ref of agentRegistry.list()) {
+				if (ref.kind === "advisor" || !ref.session) continue;
+				if (ref.memoryBackendGroupId === memoryBackendGroupId) sessions.add(ref.session);
+			}
+			return [...sessions];
+		};
 		const memoryStartOptions = () => {
 			const parentSession = liveParentSession();
 			return {
@@ -2932,15 +2997,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				parentMnemopiSessionState: parentSession
 					? parentSession.getMnemopiSessionState()
 					: options.parentMnemopiSessionState,
-				parentOpenVikingSessionState: parentSession
-					? parentSession.getOpenVikingSessionState()
-					: options.parentOpenVikingSessionState,
+				parentOpenVikingSessionState: openVikingParentTranscriptIsCurrent()
+					? parentSession
+						? parentSession.getOpenVikingSessionState()
+						: options.parentOpenVikingSessionState
+					: undefined,
 			};
 		};
 		const startMemoryBackend = async () => {
+			if (taskDepth > 0) {
+				try {
+					await liveParentSession()?.waitForMemoryBackendReconcile();
+				} catch (error) {
+					logger.debug("Subagent memory startup observed a failed parent transition", { error: String(error) });
+				}
+			}
+			alignChildMemoryBackendSelection();
 			const memoryBackend = await resolveMemoryBackend(settings);
+			if (memoryBackend.id === "openviking" && !openVikingParentTranscriptIsCurrent()) {
+				appliedMemoryBackend = memoryBackend;
+				await refreshMemoryBackendRuntime(memoryBackend);
+				return;
+			}
 			await memoryBackend.start(memoryStartOptions());
 			appliedMemoryBackend = memoryBackend;
+			if (memoryBackend.id === "openviking") await refreshMemoryBackendRuntime(memoryBackend);
 		};
 		const createMemoryRuntimeTools = async (): Promise<AgentTool[]> => {
 			const tools = await Promise.all(
@@ -2950,40 +3031,86 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			);
 			return tools.filter((tool): tool is Tool => tool !== null);
 		};
-		const refreshMemoryBackendRuntime = async (memoryBackend: MemoryBackend): Promise<boolean> => {
+		const refreshMemoryBackendRuntime = async (
+			memoryBackend: MemoryBackend,
+			stalePromptFragments: readonly string[] = [],
+		): Promise<boolean> => {
 			const openVikingUnavailable = memoryBackend.id === "openviking" && !session.getOpenVikingSessionState();
+			const detachedOpenViking = stalePromptFragments.length > 0 && !session.getOpenVikingSessionState();
 			const memoryTools = openVikingUnavailable ? [] : await createMemoryRuntimeTools();
-			await session.refreshMemoryTools(memoryTools, {
-				forceActive:
-					memoryBackend.id === "openviking" && !openVikingUnavailable ? ["recall", "retain", "reflect"] : [],
-			});
-			// A connection-only change can leave tool signatures byte-identical while
-			// changing memory instructions and the state they describe.
-			await session.refreshBaseSystemPrompt();
+			try {
+				await session.refreshMemoryTools(memoryTools, {
+					forceActive:
+						memoryBackend.id === "openviking" && !openVikingUnavailable ? ["recall", "retain", "reflect"] : [],
+					rebuildSystemPrompt: false,
+				});
+				// A connection-only change can leave tool signatures byte-identical while
+				// changing memory instructions and the state they describe.
+				await session.refreshBaseSystemPrompt();
+			} catch (error) {
+				if (detachedOpenViking) {
+					for (const fragment of stalePromptFragments) session.removeBaseSystemPromptFragment(fragment);
+				}
+				throw error;
+			}
 			return !openVikingUnavailable;
 		};
 		let initialMemoryStartupPromise: Promise<void> = Promise.resolve();
+		let pendingStalePromptFragments: string[] = [];
+		const stopAppliedMemoryBackend = async (refreshInactiveRuntime: boolean): Promise<void> => {
+			await initialMemoryStartupPromise;
+			const previousBackend = appliedMemoryBackend;
+			const currentState = session.getOpenVikingSessionState();
+			const primaryState = currentState?.aliasOf ?? currentState;
+			const stalePromptFragments =
+				previousBackend?.id === "openviking"
+					? [
+							OPENVIKING_DEVELOPER_INSTRUCTIONS,
+							currentState?.lastRecallSnippet,
+							primaryState?.lastRecallSnippet,
+						].filter((fragment): fragment is string => typeof fragment === "string" && fragment.length > 0)
+					: [];
+			if (stalePromptFragments.length > 0) pendingStalePromptFragments = [...new Set(stalePromptFragments)];
+			appliedMemoryBackend = undefined;
+			try {
+				await previousBackend?.stop?.({ session });
+			} catch (error) {
+				// OpenViking deliberately detaches after a workspace-baseline
+				// persistence failure. Keep that transition fail-closed, but make
+				// the live runtime match the detached state before surfacing it.
+				if (previousBackend?.id === "openviking" && !session.getOpenVikingSessionState()) {
+					try {
+						await refreshMemoryBackendRuntime(previousBackend, stalePromptFragments);
+					} catch (refreshError) {
+						logger.warn("OpenViking: failed to clear detached memory runtime", {
+							error: String(refreshError),
+						});
+					}
+				}
+				throw error;
+			}
+			if (refreshInactiveRuntime && previousBackend?.id === "openviking") {
+				await refreshMemoryBackendRuntime(previousBackend, stalePromptFragments);
+			}
+		};
 		session.setMemoryBackendReconciler({
 			depth: taskDepth,
 			parentSession: liveParentSession,
-			relatedSessions: () => {
-				const sessions = new Set([session]);
-				for (const ref of agentRegistry.list()) {
-					if (ref.session?.settings === settings) sessions.add(ref.session);
-				}
-				return [...sessions];
-			},
-			stop: async () => {
-				await initialMemoryStartupPromise;
-				const previousBackend = appliedMemoryBackend;
-				appliedMemoryBackend = undefined;
-				await previousBackend?.stop?.({ session });
-			},
+			relatedSessions: relatedMemorySessions,
+			suspend: async () => await stopAppliedMemoryBackend(true),
+			stop: async () => await stopAppliedMemoryBackend(false),
 			start: async ({ parentReconciled }) => {
 				if (!parentReconciled) await liveParentSession()?.waitForMemoryBackendReconcile();
 				if (session.isDisposed) return;
 
+				alignChildMemoryBackendSelection();
 				const nextBackend = await resolveMemoryBackend(settings);
+				if (nextBackend.id === "openviking" && !openVikingParentTranscriptIsCurrent()) {
+					appliedMemoryBackend = nextBackend;
+					await refreshMemoryBackendRuntime(nextBackend, pendingStalePromptFragments);
+					pendingStalePromptFragments = [];
+					return;
+				}
 				await nextBackend.start(memoryStartOptions());
 				appliedMemoryBackend = nextBackend;
 				if (session.isDisposed) {
@@ -2991,8 +3118,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					appliedMemoryBackend = undefined;
 					return;
 				}
-				if (!(await refreshMemoryBackendRuntime(nextBackend))) {
-					throw new Error("OpenViking backend failed to start with the current configuration.");
+				try {
+					if (!(await refreshMemoryBackendRuntime(nextBackend, pendingStalePromptFragments))) {
+						throw new Error("OpenViking backend failed to start with the current configuration.");
+					}
+					pendingStalePromptFragments = [];
+				} catch (error) {
+					try {
+						await nextBackend.stop?.({ session });
+					} catch (stopError) {
+						logger.warn("Memory backend cleanup failed after runtime refresh error", {
+							backend: nextBackend.id,
+							error: String(stopError),
+						});
+					}
+					if (appliedMemoryBackend === nextBackend) appliedMemoryBackend = undefined;
+					if (nextBackend.id === "openviking") {
+						try {
+							await refreshMemoryBackendRuntime(nextBackend, pendingStalePromptFragments);
+						} catch (cleanupError) {
+							logger.warn("OpenViking: failed to clear runtime after refresh error", {
+								error: String(cleanupError),
+							});
+						}
+					}
+					throw error;
 				}
 			},
 		});
@@ -3011,19 +3161,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// `learn`, but enabling auto-learn mid-session still cannot create the missing
 		// controller. The fire-time re-check handles a mid-session disable. The
 		// subscription lives for the session's lifetime; the reference is discarded.
+		// Subagent Settings are isolated snapshots. Align the inherited selector
+		// before deciding whether startup must be awaited; otherwise an `off` child
+		// can install OpenViking later without ever refreshing its tools or prompt.
+		alignChildMemoryBackendSelection();
 		const autoLearnEnabled = settings.get("autolearn.enabled") && taskDepth === 0;
 		const requiresReadyMemoryBackend = settings.get("memory.backend") === "openviking" || autoLearnEnabled;
 		initialMemoryStartupPromise = logger.time("startMemoryStartupTask", startMemoryBackend);
 		if (requiresReadyMemoryBackend) {
 			await initialMemoryStartupPromise;
 		} else {
-			void initialMemoryStartupPromise;
-		}
-		if (appliedMemoryBackend?.id === "openviking") {
-			// The initial system prompt is built before per-session OpenViking state
-			// exists. Reconcile it once startup settles; a failed connection remains a
-			// usable inert session without advertising tools that cannot execute.
-			await refreshMemoryBackendRuntime(appliedMemoryBackend);
+			void initialMemoryStartupPromise.catch(error => {
+				logger.warn("Background memory backend startup failed", { error: String(error) });
+			});
 		}
 		if (autoLearnEnabled) new AutoLearnController({ session, settings });
 

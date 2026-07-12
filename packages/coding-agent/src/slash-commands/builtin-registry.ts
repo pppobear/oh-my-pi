@@ -31,7 +31,7 @@ import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-targets";
-import type { AgentSession, FreshSessionResult } from "../session/agent-session";
+import type { AgentSession, FreshSessionResult, MemoryBackendWorkspaceTransition } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { resolveResumableSession } from "../session/session-listing";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
@@ -1709,6 +1709,10 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (runtime.session.isStreaming) return usage("Cannot move while streaming.", runtime);
 			if (!command.args) return usage("Usage: /move <path>", runtime);
 			const resolvedPath = resolveToCwd(command.args, runtime.cwd);
+			if (path.resolve(resolvedPath) === path.resolve(runtime.sessionManager.getCwd())) {
+				await runtime.output(`Already in ${resolvedPath}.`);
+				return commandConsumed();
+			}
 			try {
 				const stat = await fs.stat(resolvedPath);
 				if (!stat.isDirectory()) {
@@ -1717,14 +1721,53 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			} catch {
 				return usage(`Directory does not exist: ${resolvedPath}`, runtime);
 			}
+			let memoryTransition: MemoryBackendWorkspaceTransition | undefined;
+			try {
+				memoryTransition = await runtime.session.suspendMemoryBackendForWorkspaceTransition();
+			} catch (err) {
+				return usage(`Move cancelled: ${errorMessage(err)}`, runtime);
+			}
 			try {
 				await runtime.sessionManager.moveTo(resolvedPath);
 			} catch (err) {
-				return usage(`Move failed: ${errorMessage(err)}`, runtime);
+				const partiallyMoved = path.resolve(runtime.sessionManager.getCwd()) !== path.resolve(runtime.cwd);
+				if (memoryTransition) {
+					try {
+						await memoryTransition.complete({ restart: !partiallyMoved });
+					} catch (restartError) {
+						await runtime.output(`Memory backend restore failed: ${errorMessage(restartError)}`);
+					}
+				}
+				return usage(
+					partiallyMoved
+						? `Move partially applied; memory remains inactive: ${errorMessage(err)}`
+						: `Move failed: ${errorMessage(err)}`,
+					runtime,
+				);
 			}
-			setProjectDir(resolvedPath);
-			await runtime.settings.reloadForCwd(resolvedPath);
-			applyProviderGlobalsFromSettings(runtime.settings);
+			try {
+				setProjectDir(resolvedPath);
+				await runtime.settings.reloadForCwd(resolvedPath);
+				applyProviderGlobalsFromSettings(runtime.settings);
+			} catch (error) {
+				try {
+					await memoryTransition?.complete({ restart: false });
+				} catch {
+					// The transition already released fail-closed; preserve the cwd error below.
+				}
+				await runtime.output(
+					`Moved to ${resolvedPath}, but destination state could not be applied; memory remains inactive: ${errorMessage(error)}`,
+				);
+				await runtime.notifyConfigChanged?.();
+				await runtime.notifyTitleChanged?.();
+				return commandConsumed();
+			}
+			try {
+				if (memoryTransition) await memoryTransition.complete();
+				else await runtime.session.reconcileMemoryBackend();
+			} catch (error) {
+				await runtime.output(`Memory backend reload failed after move: ${errorMessage(error)}`);
+			}
 			// Reload plugin/capability caches so the next prompt sees commands and
 			// capabilities scoped to the new cwd.
 			await runtime.reloadPlugins();

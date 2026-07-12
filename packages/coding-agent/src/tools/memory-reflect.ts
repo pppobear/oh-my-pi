@@ -64,7 +64,7 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 			if (backend === "openviking") {
 				const state = this.session.getOpenVikingSessionState?.();
 				const primary = state?.aliasOf ?? state;
-				if (!primary) {
+				if (!state?.isReady || !primary) {
 					throw new Error("OpenViking backend is not initialised for this session.");
 				}
 				try {

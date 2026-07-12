@@ -96,6 +96,7 @@ import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
+	type MemoryBackendWorkspaceTransition,
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "../session/agent-session";
@@ -1157,18 +1158,41 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * a session from another project). The SessionManager's cwd MUST already
 	 * reflect `newCwd` before this is called.
 	 */
-	async applyCwdChange(newCwd: string): Promise<void> {
+	async applyCwdChange(newCwd: string, memoryTransition?: MemoryBackendWorkspaceTransition): Promise<void> {
 		setProjectDir(newCwd);
 		// Re-scope project settings (`.claude/settings.yml` etc.) to the new
 		// directory in place so the active session and every settings reader pick
 		// up the destination project's configuration.
 		if (isSettingsInitialized()) {
-			await settings.reloadForCwd(newCwd);
+			const settingsCwdChanged = path.resolve(settings.getCwd()) !== path.resolve(newCwd);
+			try {
+				await settings.reloadForCwd(newCwd);
+			} catch (error) {
+				await memoryTransition?.complete({ restart: false });
+				throw error;
+			}
 			// Reapply provider preferences from the newly-loaded settings so the
 			// module-level search/image provider state reflects the destination
 			// project's configuration. Without this, the previous project's
 			// exclusions leak and newly-excluded providers are still used.
 			applyProviderGlobalsFromSettings(settings);
+			// OpenViking's default peer is derived from cwd. Flush the previous
+			// workspace first, then rebuild the primary state and all aliases from
+			// the destination settings before another prompt can recall or retain.
+			if (settingsCwdChanged) {
+				try {
+					if (memoryTransition) await memoryTransition.complete();
+					else await this.session.reconcileMemoryBackend();
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					logger.warn("Memory backend rebuild failed after cwd change", { cwd: newCwd, error: message });
+					this.showError(`Moved to ${newCwd}, but the memory backend could not be rebuilt: ${message}`);
+				}
+			} else {
+				await memoryTransition?.complete();
+			}
+		} else {
+			await memoryTransition?.complete();
 		}
 		// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
 		// the next prompt sees everything scoped to the new project directory.

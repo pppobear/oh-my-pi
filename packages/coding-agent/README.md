@@ -39,9 +39,12 @@ The agent supports five mutually-exclusive memory backends, selected via the `me
 1. Start an OpenViking server or configure the official CLI in `~/.openviking/ovcli.conf`.
 2. Set `memory.backend = "openviking"`. The agent discovers the server URL and matching credentials from `ovcli.conf`; explicit `openviking.*` settings take precedence.
 3. Optional environment overrides (env wins over settings):
-   - `OPENVIKING_URL`, `OPENVIKING_BEARER_TOKEN` or `OPENVIKING_API_KEY` — connection
-   - `OPENVIKING_ACCOUNT`, `OPENVIKING_USER`, `OPENVIKING_PEER_ID` — tenant identity
+   - `OPENVIKING_URL`, `OPENVIKING_BEARER_TOKEN` or `OPENVIKING_API_KEY` — connection; `OPENVIKING_CREDENTIAL_SOURCE=cli` forces the official CLI profile
+   - `OPENVIKING_ACCOUNT`, `OPENVIKING_USER`, `OPENVIKING_PEER_ID`, `OPENVIKING_WORKSPACE_PEER` — tenant and workspace identity
+   - `OPENVIKING_RECALL_PEER_SCOPE` — `actor` (default) recalls global plus current-project memory; `all` also includes penalized memories from other projects
    - `OPENVIKING_AUTO_RECALL`, `OPENVIKING_AUTO_CAPTURE`, `OPENVIKING_RECALL_LIMIT` — lifecycle and recall
+
+By default, OMP derives the OpenViking actor peer from the current workspace path and sends it both as `X-OpenViking-Actor-Peer` and captured-message `peer_id`, matching OpenViking's official memory plugins. Recall uses OpenViking's peer-aware `/api/v1/search/recall` endpoint with `peer_scope=actor`, so global and current-project memories remain visible without pulling memories from other projects. Set `openviking.recallPeerScope` (or `OPENVIKING_RECALL_PEER_SCOPE`) to `all` for OpenViking's broader cross-project recall, set `openviking.peerId` (or `OPENVIKING_PEER_ID`) to override the derived peer, or disable `openviking.workspacePeer` (or set `OPENVIKING_WORKSPACE_PEER=0`) to use the server's unscoped default.
 
 OpenViking commits have two phases. The server archives new session messages synchronously, then extracts durable memories in an asynchronous task. Explicit `retain` and `learn` calls poll that task for a bounded time and distinguish created memories, zero-memory completion, failure, a known queue, and unavailable/interrupted task status; automatic transcript capture accepts the archive and monitors extraction in the background so it does not block session transitions.
 

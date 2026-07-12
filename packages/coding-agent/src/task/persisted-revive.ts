@@ -96,6 +96,8 @@ export function createPersistedSubagentReviverFactory(
 				agentDisplayName: ref.displayName,
 				parentTaskPrefix: ref.id,
 				parentAgentId: ref.parentId,
+				parentTranscriptId: init.parentTranscriptId ?? null,
+				parentWorkspaceCwd: init.parentWorkspaceCwd ?? null,
 				taskDepth,
 				toolNames: init.tools,
 				outputSchema: init.outputSchema,

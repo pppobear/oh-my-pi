@@ -3,6 +3,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { composeRecallQuery, truncateRecallQuery } from "../hindsight/content";
 import { extractMessages } from "../hindsight/transcript";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import { SESSION_CWD_TRANSITION_CUSTOM_TYPE } from "../session/session-entries";
 import type {
 	OpenVikingApi,
 	OpenVikingCommitStart,
@@ -150,6 +151,7 @@ export class OpenVikingSessionState {
 	readonly client: OpenVikingApi;
 	readonly session: AgentSession;
 	readonly aliasOf?: OpenVikingSessionState;
+	readonly #aliasedPrimarySessionId?: string;
 	lastRecallSnippet?: string;
 	lastCapturedMessageCount: number;
 	lastCommittedTurn: number;
@@ -165,6 +167,7 @@ export class OpenVikingSessionState {
 	#sessionEpoch = 0;
 	#readyEpochs = new Set<number>([0]);
 	#acceptWrites = true;
+	readonly #workspaceCwd: string;
 
 	constructor(options: OpenVikingSessionStateOptions) {
 		this.sessionId = deriveOpenVikingSessionId(options.sessionId);
@@ -172,6 +175,8 @@ export class OpenVikingSessionState {
 		this.client = options.client;
 		this.session = options.session;
 		this.aliasOf = options.aliasOf;
+		this.#aliasedPrimarySessionId = options.aliasOf?.sessionId;
+		this.#workspaceCwd = options.session.settings.getCwd();
 		const persisted = this.#loadCaptureCursor(this.sessionId);
 		// A session without a cursor deliberately starts from zero: replaying is
 		// at-least-once and cannot lose a tail that crashed before it was recorded.
@@ -183,7 +188,12 @@ export class OpenVikingSessionState {
 	}
 
 	get isReady(): boolean {
-		return this.aliasOf?.isReady ?? this.#readyEpochs.has(this.#sessionEpoch);
+		return (
+			this.#acceptWrites &&
+			(this.aliasOf
+				? this.aliasOf.isReady && this.aliasOf.sessionId === this.#aliasedPrimarySessionId
+				: this.#readyEpochs.has(this.#sessionEpoch))
+		);
 	}
 
 	async rekeySession(sessionId: string, options: OpenVikingRekeyOptions = {}): Promise<boolean> {
@@ -296,8 +306,9 @@ export class OpenVikingSessionState {
 	}
 
 	async search(query: string, limit: number): Promise<OpenVikingSearchItem[]> {
+		if (!this.isReady) return [];
 		const items = await this.client.search(query, limit);
-		return items.filter(item => (item.score ?? 0) >= this.config.scoreThreshold);
+		return this.isReady ? items.filter(item => (item.score ?? 0) >= this.config.scoreThreshold) : [];
 	}
 
 	async save(content: string, context?: string): Promise<OpenVikingSaveOutcome> {
@@ -438,6 +449,9 @@ export class OpenVikingSessionState {
 	}
 
 	async recallForCompaction(messages: AgentMessage[]): Promise<string | undefined> {
+		if (!this.isReady) return undefined;
+		const sessionId = this.sessionId;
+		const epoch = this.#sessionEpoch;
 		const flat = flattenAgentMessages(messages);
 		const lastUser = flat.findLast(message => message.role === "user");
 		if (!lastUser) return undefined;
@@ -449,8 +463,9 @@ export class OpenVikingSessionState {
 		);
 		const [recall, sessionContext] = await Promise.all([
 			this.recallForContext(truncated),
-			this.client.getSessionContext(this.sessionId, this.config.recallTokenBudget),
+			this.client.getSessionContext(sessionId, this.config.recallTokenBudget),
 		]);
+		if (!this.isReady || this.sessionId !== sessionId || this.#sessionEpoch !== epoch) return undefined;
 		return (
 			[
 				recall,
@@ -1163,26 +1178,104 @@ export class OpenVikingSessionState {
 		return extractMessages({ getEntries: () => this.session.sessionManager.getBranch() });
 	}
 
-	#captureCursorIdentity(sessionId: string): OpenVikingCursorIdentity {
-		const baseUrl = normalizeBaseUrl(this.client.baseUrl || this.config.baseUrl);
+	/**
+	 * Seed the destination workspace scope at the current transcript boundary.
+	 * Historical turns must not be replayed into a different workspace merely
+	 * because `/move` changed cwd. The old scope keeps its own cursor so any tail
+	 * that could not be flushed remains recoverable if that workspace is resumed.
+	 */
+	baselineWorkspaceTransition(nextConfig: OpenVikingConfig, sourceFlushed: boolean): boolean {
+		const currentIdentity = this.#captureCursorIdentity(this.sessionId);
+		const nextIdentity = this.#captureCursorIdentity(this.sessionId, nextConfig);
+		const workspaceChanged = this.#workspaceCwd !== this.session.settings.getCwd();
+		if (!workspaceChanged) return true;
+		if (!sourceFlushed) return false;
+		if (cursorIdentityEquals(currentIdentity, nextIdentity)) return true;
+
+		const messages = this.#activeMessages();
+		try {
+			this.session.sessionManager.appendCustomEntry(OPENVIKING_CAPTURE_CURSOR_TYPE, {
+				version: OPENVIKING_CAPTURE_CURSOR_VERSION,
+				identity: nextIdentity,
+				capturedMessageCount: messages.length,
+				archivedUserTurns: messages.filter(message => message.role === "user").length,
+				hasUnarchivedRemoteMessages: false,
+				commitTaskBaseline: null,
+				pendingExtractions: [],
+			} satisfies OpenVikingCaptureCursor);
+			return true;
+		} catch (error) {
+			logger.warn("OpenViking: workspace transition baseline persistence failed", {
+				sessionId: this.sessionId,
+				error: String(error),
+			});
+			return false;
+		}
+	}
+
+	#captureCursorIdentity(sessionId: string, config: OpenVikingConfig = this.config): OpenVikingCursorIdentity {
+		const baseUrl = normalizeBaseUrl(config.baseUrl);
 		return {
 			baseUrl,
-			credentialFingerprint: fingerprintCredential(baseUrl, this.config.apiKey),
-			accountId: this.config.accountId,
-			userId: this.config.userId,
-			peerId: this.config.peerId,
+			credentialFingerprint: fingerprintCredential(baseUrl, config.apiKey),
+			accountId: config.accountId,
+			userId: config.userId,
+			peerId: config.peerId,
 			sessionId,
 		};
 	}
 
 	#loadCaptureCursor(sessionId: string): OpenVikingCaptureCursor | undefined {
 		const expectedIdentity = this.#captureCursorIdentity(sessionId);
-		for (const entry of this.session.sessionManager.getBranch().toReversed()) {
+		const branch = this.session.sessionManager.getBranch();
+		let cwdTransitionIndex = -1;
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (
+				entry.type === "custom" &&
+				entry.customType === SESSION_CWD_TRANSITION_CUSTOM_TYPE &&
+				entry.data &&
+				typeof entry.data === "object" &&
+				(entry.data as Record<string, unknown>).version === 1
+			) {
+				cwdTransitionIndex = index;
+				break;
+			}
+		}
+		let workspaceUpgrade: OpenVikingCaptureCursor | undefined;
+		let sawNewerScopedCursor = false;
+		for (let index = branch.length - 1; index > cwdTransitionIndex; index--) {
+			const entry = branch[index];
 			if (entry.type !== "custom" || entry.customType !== OPENVIKING_CAPTURE_CURSOR_TYPE) continue;
 			const data = parseCaptureCursor(entry.data);
 			if (data && cursorIdentityEquals(data.identity, expectedIdentity)) return data;
+			if (!data || !cursorConnectionIdentityEquals(data.identity, expectedIdentity)) continue;
+			if (data.identity.peerId !== null) {
+				sawNewerScopedCursor = true;
+				continue;
+			}
+			if (
+				!workspaceUpgrade &&
+				!sawNewerScopedCursor &&
+				this.config.peerSource === "workspace" &&
+				expectedIdentity.peerId !== null &&
+				data.identity.peerId === null
+			) {
+				workspaceUpgrade = data;
+			}
 		}
-		return undefined;
+		if (workspaceUpgrade) return workspaceUpgrade;
+		if (cwdTransitionIndex < 0) return undefined;
+		const messagesBeforeTransition = extractMessages({ getEntries: () => branch.slice(0, cwdTransitionIndex) });
+		return {
+			version: OPENVIKING_CAPTURE_CURSOR_VERSION,
+			identity: expectedIdentity,
+			capturedMessageCount: messagesBeforeTransition.length,
+			archivedUserTurns: messagesBeforeTransition.filter(message => message.role === "user").length,
+			hasUnarchivedRemoteMessages: false,
+			commitTaskBaseline: null,
+			pendingExtractions: [],
+		};
 	}
 
 	#persistCaptureCursor(sessionId: string): boolean {
@@ -1215,13 +1308,14 @@ export class OpenVikingSessionState {
 	}
 
 	async formatItems(items: readonly OpenVikingSearchItem[], includeIds = false): Promise<string | undefined> {
-		if (items.length === 0) return undefined;
+		if (!this.isReady || items.length === 0) return undefined;
 		let budgetRemaining = this.config.recallTokenBudget;
 		const lines = ["<openviking-context>", OPENVIKING_CONTEXT_HEADER];
 		for (const item of items) {
+			if (!this.isReady) return undefined;
 			const score =
 				typeof item.score === "number" ? ` ${(Math.max(0, Math.min(1, item.score)) * 100).toFixed(0)}%` : "";
-			const source = item._sourceType ?? "memory";
+			const source = recallSourceLabel(item);
 			const memoryUri = memoryUriFromOpenVikingUri(item.uri);
 			const uriLine = `- [${source}${score}] ${memoryUri}${includeIds ? ` (id: ${memoryUri})` : ""}`;
 			if (budgetRemaining <= 0) {
@@ -1238,24 +1332,58 @@ export class OpenVikingSessionState {
 			lines.push(contentLine);
 			budgetRemaining -= lineTokens;
 		}
+		if (!this.isReady) return undefined;
 		lines.push("</openviking-context>");
 		return lines.join("\n");
 	}
 
 	async resolveItemContent(item: OpenVikingSearchItem): Promise<string> {
-		let content = "";
-		const summary = (item.abstract || item.overview || "").trim();
-		if (this.config.recallPreferAbstract && summary) {
-			content = summary;
-		} else if (item.level === 2 || item.uri.endsWith(".md")) {
-			content = (await this.client.readContent(item.uri))?.trim() || summary || memoryUriFromOpenVikingUri(item.uri);
-		} else {
-			content = summary || memoryUriFromOpenVikingUri(item.uri);
+		const memoryUri = memoryUriFromOpenVikingUri(item.uri);
+		const abstract = (item.abstract || item.overview || "").trim();
+		const serverSummary = typeof item.summary === "string" ? item.summary.trim() : "";
+		const recalledContent = typeof item.content === "string" ? item.content.trim() : "";
+		let content: string;
+		switch (item.mode) {
+			case "full":
+				content = recalledContent || serverSummary || abstract || memoryUri;
+				break;
+			case "summary":
+				content = serverSummary || abstract || memoryUri;
+				break;
+			case "uri":
+				content = memoryUri;
+				break;
+			default: {
+				const summary = abstract || serverSummary;
+				if (this.config.recallPreferAbstract && summary) {
+					content = summary;
+				} else if (recalledContent) {
+					content = recalledContent;
+				} else if (item.level === 2 || item.uri.endsWith(".md")) {
+					content = (await this.client.readContent(item.uri))?.trim() || summary || memoryUri;
+				} else {
+					content = summary || memoryUri;
+				}
+			}
 		}
 		if (content.length > this.config.recallMaxContentChars) {
 			return `${content.slice(0, this.config.recallMaxContentChars)}...`;
 		}
 		return content;
+	}
+}
+
+function recallSourceLabel(item: OpenVikingSearchItem): string {
+	if (item._sourceType === "skill") return "skill";
+	switch (item.origin) {
+		case "actor_peer":
+			return "memory/current-project";
+		case "self":
+			return "memory/global";
+		case "other_peer":
+			return "memory/other-projects";
+		default:
+			return "memory";
 	}
 }
 
@@ -1451,12 +1579,15 @@ function isNonNegativeInteger(value: unknown): value is number {
 }
 
 function cursorIdentityEquals(a: OpenVikingCursorIdentity, b: OpenVikingCursorIdentity): boolean {
+	return cursorConnectionIdentityEquals(a, b) && a.peerId === b.peerId;
+}
+
+function cursorConnectionIdentityEquals(a: OpenVikingCursorIdentity, b: OpenVikingCursorIdentity): boolean {
 	return (
 		a.baseUrl === b.baseUrl &&
 		a.credentialFingerprint === b.credentialFingerprint &&
 		a.accountId === b.accountId &&
 		a.userId === b.userId &&
-		a.peerId === b.peerId &&
 		a.sessionId === b.sessionId
 	);
 }

@@ -18,7 +18,7 @@ import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
-import type { AgentSession } from "../session/agent-session";
+import type { AgentSession, MemoryBackendWorkspaceTransition } from "../session/agent-session";
 import type { CompactMode } from "../session/compact-modes";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext } from "../session/session-context";
@@ -347,7 +347,7 @@ export interface InteractiveModeContext {
 	): Promise<CompactionOutcome>;
 	openInBrowser(urlOrPath: string): void;
 	refreshSlashCommandState(cwd?: string): Promise<void>;
-	applyCwdChange(newCwd: string): Promise<void>;
+	applyCwdChange(newCwd: string, memoryTransition?: MemoryBackendWorkspaceTransition): Promise<void>;
 
 	// Selector handling
 	showSettingsSelector(): void;

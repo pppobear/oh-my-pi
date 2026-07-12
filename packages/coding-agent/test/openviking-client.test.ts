@@ -8,6 +8,9 @@ const config: OpenVikingConfig = {
 	accountId: null,
 	userId: null,
 	peerId: null,
+	peerSource: "none",
+	workspacePeer: false,
+	recallPeerScope: "actor",
 	timeoutMs: 1_000,
 	captureTimeoutMs: 1_000,
 	autoRecall: true,
@@ -77,6 +80,410 @@ describe("OpenViking API error mapping", () => {
 		await expect(client.readContent("viking://user/memories/preferences.md")).rejects.toThrow(
 			"response did not contain text",
 		);
+	});
+});
+
+describe("OpenViking peer-aware recall", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("recalls current-peer memories through the v0.4.9 recall endpoint", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown>; actorPeer: string | null }> = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			const url = String(input);
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push({ url, body, actorPeer: new Headers(init?.headers).get("X-OpenViking-Actor-Peer") });
+			if (url.endsWith("/api/v1/search/recall")) {
+				return Response.json({
+					status: "ok",
+					result: {
+						entries: [
+							{
+								uri: "viking://user/test/peers/project-a/memories/preferences/editor.md",
+								score: 0.91,
+								type: "preferences",
+								mode: "full",
+								content: "Prefers concise reviews.",
+								origin: "actor_peer",
+							},
+						],
+						rendered: "",
+						stats: {},
+					},
+				});
+			}
+			return Response.json({ status: "ok", result: { skills: [] } });
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({
+			...config,
+			peerId: "project-a",
+			peerSource: "workspace",
+			workspacePeer: true,
+		});
+
+		const result = await client.search("editor preference");
+
+		expect(result).toHaveLength(1);
+		expect(result[0]).toMatchObject({
+			category: "preferences",
+			content: "Prefers concise reviews.",
+			origin: "actor_peer",
+			_sourceType: "memory",
+		});
+		const recallRequest = requests.find(request => request.url.endsWith("/api/v1/search/recall"));
+		expect(recallRequest).toMatchObject({
+			actorPeer: "project-a",
+			body: {
+				peer_scope: "actor",
+				min_score: 0.35,
+				render: false,
+			},
+		});
+	});
+
+	it("retries v0.4.8 recall without peer_scope and keeps current-peer memories", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+		let recallRequests = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			const url = String(input);
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push({ url, body });
+			if (url.endsWith("/api/v1/search/recall")) {
+				recallRequests++;
+				if (recallRequests === 1) {
+					return Response.json(
+						{ status: "error", error: { code: "INVALID_ARGUMENT", message: "peer_scope unsupported" } },
+						{ status: 422 },
+					);
+				}
+				return Response.json({
+					status: "ok",
+					result: {
+						entries: [
+							{
+								uri: "viking://user/test/peers/project-a/memories/preferences/editor.md",
+								score: 0.88,
+								type: "preferences",
+								mode: "full",
+								content: "Uses the project editor settings.",
+								rank: 1,
+							},
+						],
+						rendered: "",
+						stats: {},
+					},
+				});
+			}
+			return Response.json({ status: "ok", result: { skills: [] } });
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
+
+		await expect(client.search("editor preference")).resolves.toMatchObject([
+			{
+				uri: "viking://user/test/peers/project-a/memories/preferences/editor.md",
+				_sourceType: "memory",
+			},
+		]);
+		expect(recallRequests).toBe(2);
+		const recallBodies = requests
+			.filter(request => request.url.endsWith("/api/v1/search/recall"))
+			.map(request => request.body);
+		expect(recallBodies[0]?.peer_scope).toBe("actor");
+		expect(recallBodies[1]).not.toHaveProperty("peer_scope");
+		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(false);
+	});
+
+	it("uses legacy find only when the recall endpoint is absent", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			const url = String(input);
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push({ url, body });
+			if (url.endsWith("/api/v1/search/recall")) {
+				return Response.json(
+					{ status: "error", error: { code: "NOT_FOUND", message: "not found" } },
+					{ status: 404 },
+				);
+			}
+			if (body.target_uri === "viking://user/memories") {
+				return Response.json({
+					status: "ok",
+					result: { memories: [{ uri: "viking://user/memories/preferences/global.md", score: 0.8 }] },
+				});
+			}
+			return Response.json({ status: "ok", result: { skills: [] } });
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
+
+		await expect(client.search("global preference")).resolves.toMatchObject([
+			{ uri: "viking://user/memories/preferences/global.md", _sourceType: "memory" },
+		]);
+		expect(requests.filter(request => request.url.endsWith("/api/v1/search/recall"))).toHaveLength(1);
+		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(true);
+	});
+
+	it("surfaces a validation failure after the peer_scope downgrade", async () => {
+		let recallRequests = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			recallRequests++;
+			return Response.json(
+				{
+					status: "error",
+					error: {
+						code: "INVALID_ARGUMENT",
+						message: recallRequests === 1 ? "peer_scope unsupported" : "invalid recall quotas",
+					},
+				},
+				{ status: recallRequests === 1 ? 422 : 400 },
+			);
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
+
+		await expect(client.search("editor preference")).rejects.toThrow("invalid recall quotas");
+		expect(recallRequests).toBe(2);
+	});
+
+	it("rejects malformed recall text fields before rendering them", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			return Response.json({
+				status: "ok",
+				result: {
+					entries: [
+						{
+							uri: "viking://user/memories/entities/service.md",
+							type: "entities",
+							content: 42,
+						},
+					],
+					rendered: "",
+					stats: {},
+				},
+			});
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi(config);
+
+		await expect(client.search("service owner")).rejects.toThrow("entry 0 has an invalid content");
+	});
+
+	it("preserves server order across memory types and per-type peer ranks", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			return Response.json({
+				status: "ok",
+				result: {
+					entries: [
+						{
+							uri: "viking://user/test/peers/project-b/memories/events/deploy.md",
+							score: 0.9,
+							type: "events",
+							mode: "summary",
+							origin: "other_peer",
+							rank: 1,
+						},
+						{
+							uri: "viking://user/test/peers/project-a/memories/entities/current.md",
+							score: 0.86,
+							type: "entities",
+							mode: "summary",
+							origin: "actor_peer",
+							rank: 1,
+						},
+						{
+							uri: "viking://user/test/peers/project-b/memories/entities/other.md",
+							score: 0.95,
+							type: "entities",
+							mode: "summary",
+							origin: "other_peer",
+							rank: 2,
+						},
+					],
+					rendered: "",
+					stats: {},
+				},
+			});
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({ ...config, recallPeerScope: "all" });
+
+		const result = await client.search("service ownership", 3);
+
+		expect(result.map(item => ({ category: item.category, origin: item.origin, rank: item.rank }))).toEqual([
+			{ category: "events", origin: "other_peer", rank: 1 },
+			{ category: "entities", origin: "actor_peer", rank: 1 },
+			{ category: "entities", origin: "other_peer", rank: 2 },
+		]);
+	});
+
+	it("requests upstream per-type quotas while reserving total-result coverage", async () => {
+		let recallBody: Record<string, unknown> | undefined;
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			recallBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return Response.json({
+				status: "ok",
+				result: {
+					entries: [
+						{ uri: "viking://user/memories/events/deploy.md", score: 0.9, type: "events", rank: 1 },
+						{ uri: "viking://user/memories/entities/service.md", score: 0.8, type: "entities", rank: 1 },
+						{
+							uri: "viking://user/memories/preferences/editor.md",
+							score: 0.7,
+							type: "preferences",
+							rank: 1,
+						},
+					],
+					rendered: "",
+					stats: {},
+				},
+			});
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi(config);
+
+		const result = await client.search("deployment editor ownership", 5);
+
+		expect(recallBody?.quotas).toEqual({ events: 5, entities: 5, preferences: 3, experiences: 0 });
+		expect(result.map(item => item.category)).toEqual(["events", "entities", "preferences"]);
+	});
+
+	it("donates empty type reservations so a sparse bucket can fill the total limit", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			return Response.json({
+				status: "ok",
+				result: {
+					entries: Array.from({ length: 6 }, (_value, index) => ({
+						uri: `viking://user/memories/entities/service-${index + 1}.md`,
+						score: 0.9 - index * 0.01,
+						type: "entities",
+						rank: index + 1,
+					})),
+					rendered: "",
+					stats: {},
+				},
+			});
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi(config);
+
+		const result = await client.search("service ownership", 5);
+
+		expect(result).toHaveLength(5);
+		expect(result.every(item => item.category === "entities")).toBe(true);
+	});
+
+	it("reserves small recall limits for explicit preference queries", async () => {
+		const recallBodies: Record<string, unknown>[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			recallBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+			return Response.json({
+				status: "ok",
+				result: {
+					entries: [
+						{
+							uri: "viking://user/memories/events/editor-release.md",
+							score: 0.95,
+							type: "events",
+							rank: 1,
+						},
+						{
+							uri: "viking://user/memories/preferences/editor.md",
+							score: 0.9,
+							type: "preferences",
+							rank: 1,
+						},
+					],
+					rendered: "",
+					stats: {},
+				},
+			});
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi(config);
+
+		await expect(client.search("editor preference", 1)).resolves.toEqual([
+			expect.objectContaining({ category: "preferences" }),
+		]);
+		await expect(client.search("favorite editor", 2)).resolves.toEqual([
+			expect.objectContaining({ category: "events" }),
+			expect.objectContaining({ category: "preferences" }),
+		]);
+		await expect(client.search("likely deployment failure", 1)).resolves.toEqual([
+			expect.objectContaining({ category: "events" }),
+		]);
+		expect(recallBodies.map(body => body.quotas)).toEqual([
+			{ events: 1, entities: 1, preferences: 1, experiences: 0 },
+			{ events: 2, entities: 2, preferences: 2, experiences: 0 },
+			{ events: 1, entities: 1, preferences: 1, experiences: 0 },
+		]);
+	});
+
+	it("keeps distinct server recall entries that share an abstract", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+			if (!String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { skills: [] } });
+			}
+			return Response.json({
+				status: "ok",
+				result: {
+					entries: [
+						{
+							uri: "viking://user/memories/entities/service-a.md",
+							score: 0.9,
+							type: "entities",
+							abstract: "Service owner",
+							content: "Service A belongs to team A.",
+							rank: 1,
+						},
+						{
+							uri: "viking://user/memories/entities/service-b.md",
+							score: 0.8,
+							type: "entities",
+							abstract: "Service owner",
+							content: "Service B belongs to team B.",
+							rank: 2,
+						},
+					],
+					rendered: "",
+					stats: {},
+				},
+			});
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi(config);
+
+		const result = await client.search("service owner", 2);
+
+		expect(result.map(item => item.uri)).toEqual([
+			"viking://user/memories/entities/service-a.md",
+			"viking://user/memories/entities/service-b.md",
+		]);
 	});
 });
 
