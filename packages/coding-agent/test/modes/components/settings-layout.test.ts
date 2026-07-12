@@ -148,7 +148,6 @@ describe("settings layout", () => {
 			"openviking.commitEveryNTurns",
 			"openviking.timeoutMs",
 			"openviking.captureTimeoutMs",
-			"openviking.debug",
 		];
 		const defs = getSettingsForTab("memory").filter(def => openVikingPaths.includes(def.path));
 

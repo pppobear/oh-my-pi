@@ -510,69 +510,6 @@ export class OpenVikingSessionState {
 		});
 	}
 
-	async commit(): Promise<boolean> {
-		const sessionId = this.sessionId;
-		const epoch = this.#sessionEpoch;
-		return await this.#serialize(async () => {
-			const outcome = await this.#archivePendingMessages(
-				sessionId,
-				this.lastCapturedMessageCount,
-				this.lastCommittedTurn,
-			);
-			if (outcome.status === "accepted") this.#startExtractionMonitor(outcome.pending, sessionId, epoch);
-			if (outcome.status === "unknown") this.#startCommitRecoveryMonitor(sessionId, epoch);
-			return outcome.status === "accepted" || outcome.status === "skipped";
-		});
-	}
-
-	async retainMessages(messages: Array<{ role: string; content: string }>): Promise<boolean> {
-		const sessionId = this.sessionId;
-		const epoch = this.#sessionEpoch;
-		return await this.#serialize(async () => {
-			if (this.#commitTaskBaseline !== null) {
-				const recovery = await this.#archivePendingMessages(
-					sessionId,
-					this.lastCapturedMessageCount,
-					this.lastCommittedTurn,
-				);
-				if (recovery.status === "accepted") {
-					this.#startExtractionMonitor(recovery.pending, sessionId, epoch);
-				} else if (recovery.status === "orphaned") {
-					this.session.emitNotice("warning", `${recovery.error}: ${recovery.archiveUri}`, "OpenViking");
-				} else {
-					if (recovery.status === "unknown") this.#startCommitRecoveryMonitor(sessionId, epoch);
-					return false;
-				}
-			}
-			const retained = await this.#retainMessages(sessionId, messages);
-			if (retained && this.#pendingCommit) this.#persistCaptureCursor(sessionId);
-			return retained;
-		});
-	}
-
-	async #retainMessages(sessionId: string, messages: Array<{ role: string; content: string }>): Promise<boolean> {
-		const normalized = messages
-			.map(message => ({ role: normalizeRole(message.role), content: stripInjectedBlocks(message.content).trim() }))
-			.filter(
-				(message): message is { role: CapturedRole; content: string } =>
-					message.role !== null &&
-					message.content.length > 0 &&
-					(this.config.captureAssistantTurns || message.role === "user"),
-			);
-		for (const message of normalized) {
-			const response = await this.client.addMessage(sessionId, {
-				role: message.role,
-				content: message.content,
-			});
-			if (!response.ok) {
-				logger.warn("OpenViking: add message failed", { sessionId, error: response.error });
-				return false;
-			}
-			this.#pendingCommit = true;
-		}
-		return true;
-	}
-
 	async #archivePendingMessages(
 		sessionId: string,
 		throughMessageCount: number,

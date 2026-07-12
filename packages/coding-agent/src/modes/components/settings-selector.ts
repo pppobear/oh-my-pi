@@ -982,8 +982,6 @@ export class SettingsSelectorComponent implements Component {
 				return String(config.timeoutMs);
 			case "openviking.captureTimeoutMs":
 				return String(config.captureTimeoutMs);
-			case "openviking.debug":
-				return String(config.debug);
 			default:
 				return undefined;
 		}

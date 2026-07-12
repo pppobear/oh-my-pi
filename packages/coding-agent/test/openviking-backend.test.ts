@@ -54,7 +54,6 @@ const baseConfig: OpenVikingConfig = {
 	recallContextTurns: 3,
 	captureAssistantTurns: true,
 	commitEveryNTurns: 2,
-	debug: false,
 };
 
 function commitAccepted(taskId = "task-1", sessionId = "omp-session-1") {
@@ -118,7 +117,13 @@ function deriveLegacyWorkspacePeerId(cwd: string): string {
 	return cwd.replace(/[^A-Za-z0-9]/g, "-");
 }
 
-function makeFakeSession(settings: Settings, entries: Array<{ role: "user" | "assistant"; content: string }> = []) {
+function makeFakeSession(
+	settings: Settings,
+	entries: Array<{
+		role: "user" | "assistant";
+		content: string | Array<{ type: "text"; text: string }>;
+	}> = [],
+) {
 	const listeners = new Set<AgentSessionEventListener>();
 	const customEntries: CustomEntry[] = [];
 	const notices: Array<{ level: string; message: string; source?: string }> = [];
@@ -1105,10 +1110,9 @@ describe("OpenViking memory backend", () => {
 
 		await expect(state.save("first attempt")).resolves.toMatchObject({ status: "reconciling" });
 		await expect(state.save("must wait")).resolves.toMatchObject({ status: "reconciling" });
-		await expect(state.retainMessages([{ role: "user", content: "must also wait" }])).resolves.toBe(false);
 		expect(client.addMessage).toHaveBeenCalledTimes(1);
 		expect(client.commitSession).toHaveBeenCalledTimes(1);
-		expect(client.listCommitTasks).toHaveBeenCalledTimes(4);
+		expect(client.listCommitTasks).toHaveBeenCalledTimes(3);
 	});
 
 	it("does not retry an expired zero-delta recovery without persisted Phase 1 evidence", async () => {
@@ -1154,14 +1158,14 @@ describe("OpenViking memory backend", () => {
 			session: session as never,
 		});
 
-		await expect(state.commit()).resolves.toBe(false);
+		await expect(state.forceRetainCurrentSession()).resolves.toBe(false);
 		expect(client.commitSession).not.toHaveBeenCalled();
 		expect(session.customEntries.at(-1)?.data).toMatchObject({
 			hasUnarchivedRemoteMessages: true,
 			commitTaskBaseline: { taskIds: [], preparedAt: 0 },
 		});
 
-		await expect(state.commit()).resolves.toBe(false);
+		await expect(state.forceRetainCurrentSession()).resolves.toBe(false);
 		expect(client.commitSession).not.toHaveBeenCalled();
 	});
 
@@ -1300,7 +1304,7 @@ describe("OpenViking memory backend", () => {
 			session: session as never,
 		});
 
-		await expect(resumedState.commit()).resolves.toBe(true);
+		await expect(resumedState.forceRetainCurrentSession()).resolves.toBe(true);
 		expect(secondClient.commitSession).not.toHaveBeenCalled();
 		const latestCursor = session.customEntries.at(-1)?.data as
 			| {
@@ -2716,7 +2720,13 @@ describe("OpenViking memory backend", () => {
 
 	it("captures new turns without retaining injected OpenViking blocks", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
-		const session = makeFakeSession(settings);
+		const session = makeFakeSession(settings, [
+			{
+				role: "user",
+				content: "remember my editor preference\n<openviking-context>old memory</openviking-context>",
+			},
+			{ role: "assistant", content: [{ type: "text", text: "Got it." }] },
+		]);
 		const added: Array<{ role: string; content: string }> = [];
 		const client = {
 			addMessage: vi.fn(async (_sessionId: string, payload: { role: string; content?: string }) => {
@@ -2732,13 +2742,7 @@ describe("OpenViking memory backend", () => {
 			session: session as never,
 		});
 
-		await state.retainMessages([
-			{
-				role: "user",
-				content: "remember my editor preference\n<openviking-context>old memory</openviking-context>",
-			},
-			{ role: "assistant", content: "Got it." },
-		]);
+		await state.forceRetainCurrentSession();
 
 		expect(added).toEqual([
 			{ role: "user", content: "remember my editor preference" },

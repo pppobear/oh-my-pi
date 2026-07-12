@@ -5,6 +5,7 @@ import type {
 	MemoryBackend,
 	MemoryBackendSaveInput,
 	MemoryBackendSearchItem,
+	MemoryBackendSearchResult,
 	MemoryBackendStartOptions,
 } from "../memory-backend/types";
 import openVikingDeveloperInstructions from "../prompts/system/openviking-developer-instructions.md" with {
@@ -217,43 +218,14 @@ export const openVikingBackend: MemoryBackend = {
 				message: "OpenViking backend is not initialised for this session.",
 			};
 		}
-		if (options?.signal?.aborted) {
-			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
-		}
-		const limit = Math.max(1, Math.floor(options?.limit ?? primary.config.recallLimit));
-		let results: OpenVikingSearchItem[];
+		const interrupted = openVikingSearchInterruption(query, primary, options?.signal);
+		if (interrupted) return interrupted;
 		try {
-			results = await primary.search(query, limit, options?.signal);
-		} catch (error) {
-			if (options?.signal?.aborted) {
-				return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
-			}
-			if (!primary.isReady) {
-				return {
-					backend: "openviking" as const,
-					query,
-					count: 0,
-					items: [],
-					message: "OpenViking workspace changed while search was running.",
-				};
-			}
-			throw error;
-		}
-		if (options?.signal?.aborted) {
-			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
-		}
-		if (!primary.isReady) {
-			return {
-				backend: "openviking" as const,
-				query,
-				count: 0,
-				items: [],
-				message: "OpenViking workspace changed while search was running.",
-			};
-		}
-		let items: MemoryBackendSearchItem[];
-		try {
-			items = await Promise.all(
+			const limit = Math.max(1, Math.floor(options?.limit ?? primary.config.recallLimit));
+			const results: OpenVikingSearchItem[] = await primary.search(query, limit, options?.signal);
+			const afterSearch = openVikingSearchInterruption(query, primary, options?.signal);
+			if (afterSearch) return afterSearch;
+			const items: MemoryBackendSearchItem[] = await Promise.all(
 				results.map(async item => {
 					const uri = memoryUriFromOpenVikingUri(item.uri);
 					return {
@@ -272,34 +244,14 @@ export const openVikingBackend: MemoryBackend = {
 					};
 				}),
 			);
+			const afterResolution = openVikingSearchInterruption(query, primary, options?.signal);
+			if (afterResolution) return afterResolution;
+			return { backend: "openviking" as const, query, count: items.length, items };
 		} catch (error) {
-			if (options?.signal?.aborted) {
-				return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
-			}
-			if (!primary.isReady) {
-				return {
-					backend: "openviking" as const,
-					query,
-					count: 0,
-					items: [],
-					message: "OpenViking workspace changed while search was running.",
-				};
-			}
+			const afterFailure = openVikingSearchInterruption(query, primary, options?.signal);
+			if (afterFailure) return afterFailure;
 			throw error;
 		}
-		if (options?.signal?.aborted) {
-			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
-		}
-		if (!primary.isReady) {
-			return {
-				backend: "openviking" as const,
-				query,
-				count: 0,
-				items: [],
-				message: "OpenViking workspace changed while search was running.",
-			};
-		}
-		return { backend: "openviking" as const, query, count: items.length, items };
 	},
 
 	async save({ session }, input: MemoryBackendSaveInput) {
@@ -348,3 +300,23 @@ export const openVikingBackend: MemoryBackend = {
 		return await primary?.recallForCompaction(messages);
 	},
 };
+
+function openVikingSearchInterruption(
+	query: string,
+	state: OpenVikingSessionState,
+	signal?: AbortSignal,
+): MemoryBackendSearchResult | undefined {
+	if (signal?.aborted) {
+		return { backend: "openviking", query, count: 0, items: [], message: "Search aborted." };
+	}
+	if (!state.isReady) {
+		return {
+			backend: "openviking",
+			query,
+			count: 0,
+			items: [],
+			message: "OpenViking workspace changed while search was running.",
+		};
+	}
+	return undefined;
+}

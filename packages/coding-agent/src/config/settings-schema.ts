@@ -3004,18 +3004,6 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"openviking.debug": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "memory",
-			group: "OpenViking",
-			label: "OpenViking Debug Logging",
-			description: "Enable additional OpenViking backend debug logging",
-			condition: "openvikingActive",
-		},
-	},
-
 	// Hindsight (https://hindsight.vectorize.io)
 	"hindsight.apiUrl": {
 		type: "string",

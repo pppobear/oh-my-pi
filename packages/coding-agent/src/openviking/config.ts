@@ -26,7 +26,6 @@ export interface OpenVikingConfig {
 	recallContextTurns: number;
 	captureAssistantTurns: boolean;
 	commitEveryNTurns: number;
-	debug: boolean;
 }
 
 interface OpenVikingCliConfigFile {
@@ -61,7 +60,6 @@ interface OpenVikingHarnessConfig {
 	recallContextTurns?: unknown;
 	captureAssistantTurns?: unknown;
 	commitEveryNTurns?: unknown;
-	debug?: unknown;
 }
 
 interface OpenVikingLegacyConfigFile {
@@ -153,8 +151,13 @@ function configuredStringSetting(settings: Settings, path: SettingPath): string 
 	return settings.isConfigured(path) ? asString(settings.get(path)) : undefined;
 }
 
-function resolveConfigValue<T>(ompValue: T | undefined, officialValue: T | undefined): T | undefined {
-	return ompValue ?? officialValue;
+function resolveOpenVikingSetting<P extends SettingPath>(
+	settings: Settings,
+	path: P,
+	environmentValue: SettingValue<P> | undefined,
+	officialValue: SettingValue<P> | undefined,
+): SettingValue<P> {
+	return environmentValue ?? configuredSetting(settings, path) ?? officialValue ?? settings.get(path);
 }
 
 type OpenVikingEnvironmentValue = string | boolean | number;
@@ -201,7 +204,6 @@ const OPENVIKING_ENVIRONMENT_SETTINGS: Partial<Record<SettingPath, OpenVikingEnv
 		names: ["OPENVIKING_CAPTURE_TIMEOUT_MS"],
 		parse: finiteNumberFromUnknown,
 	},
-	"openviking.debug": { names: ["OPENVIKING_DEBUG"], parse: boolFromUnknown },
 };
 
 const OPENVIKING_CREDENTIAL_SETTING_PATHS = new Set<SettingPath>([
@@ -385,25 +387,34 @@ export async function loadOpenVikingConfig(
 	const baseUrl = normalizedExplicitBaseUrl ?? discoveredProfile?.baseUrl ?? DEFAULT_BASE_URL;
 
 	const timeoutMs = intAtLeast(
-		openVikingEnvironmentNumber("openviking.timeoutMs", env) ??
-			resolveConfigValue(configuredSetting(settings, "openviking.timeoutMs"), cc?.timeoutMs),
-		15_000,
+		resolveOpenVikingSetting(
+			settings,
+			"openviking.timeoutMs",
+			openVikingEnvironmentNumber("openviking.timeoutMs", env),
+			finiteNumberFromUnknown(cc?.timeoutMs),
+		),
+		settings.get("openviking.timeoutMs"),
 		1_000,
 	);
-	const captureTimeoutMs = intAtLeast(
+	const configuredCaptureTimeoutMs =
 		openVikingEnvironmentNumber("openviking.captureTimeoutMs", env) ??
-			resolveConfigValue(configuredSetting(settings, "openviking.captureTimeoutMs"), cc?.captureTimeoutMs),
-		Math.max(timeoutMs * 2, 30_000),
+		configuredSetting(settings, "openviking.captureTimeoutMs") ??
+		finiteNumberFromUnknown(cc?.captureTimeoutMs);
+	const captureTimeoutMs = intAtLeast(
+		configuredCaptureTimeoutMs,
+		Math.max(timeoutMs * 2, settings.get("openviking.captureTimeoutMs")),
 		1_000,
 	);
 	const explicitPeerId =
 		(allowEnvironmentCredentials ? openVikingEnvironmentString("openviking.peerId", env) : undefined) ??
 		configuredStringSetting(settings, "openviking.peerId") ??
 		discoveredProfile?.peerId;
-	const workspacePeer =
-		openVikingEnvironmentBoolean("openviking.workspacePeer", env) ??
-		resolveConfigValue(configuredSetting(settings, "openviking.workspacePeer"), boolFromUnknown(cc?.workspacePeer)) ??
-		true;
+	const workspacePeer = resolveOpenVikingSetting(
+		settings,
+		"openviking.workspacePeer",
+		openVikingEnvironmentBoolean("openviking.workspacePeer", env),
+		boolFromUnknown(cc?.workspacePeer),
+	);
 	const peerId = explicitPeerId ?? (workspacePeer ? deriveOpenVikingWorkspacePeerId(settings.getCwd()) : null);
 
 	return {
@@ -426,82 +437,108 @@ export async function loadOpenVikingConfig(
 		peerId,
 		peerSource: explicitPeerId ? "explicit" : peerId ? "workspace" : "none",
 		workspacePeer,
-		recallPeerScope:
-			recallPeerScopeFromUnknown(openVikingEnvironmentString("openviking.recallPeerScope", env)) ??
-			configuredSetting(settings, "openviking.recallPeerScope") ??
-			recallPeerScopeFromUnknown(cc?.recallPeerScope) ??
-			"actor",
+		recallPeerScope: resolveOpenVikingSetting(
+			settings,
+			"openviking.recallPeerScope",
+			recallPeerScopeFromUnknown(openVikingEnvironmentString("openviking.recallPeerScope", env)),
+			recallPeerScopeFromUnknown(cc?.recallPeerScope),
+		),
 		timeoutMs,
 		captureTimeoutMs,
-		autoRecall:
-			openVikingEnvironmentBoolean("openviking.autoRecall", env) ??
-			resolveConfigValue(configuredSetting(settings, "openviking.autoRecall"), boolFromUnknown(cc?.autoRecall)) ??
-			true,
-		autoRetain:
-			openVikingEnvironmentBoolean("openviking.autoRetain", env) ??
-			resolveConfigValue(configuredSetting(settings, "openviking.autoRetain"), boolFromUnknown(cc?.autoCapture)) ??
-			true,
+		autoRecall: resolveOpenVikingSetting(
+			settings,
+			"openviking.autoRecall",
+			openVikingEnvironmentBoolean("openviking.autoRecall", env),
+			boolFromUnknown(cc?.autoRecall),
+		),
+		autoRetain: resolveOpenVikingSetting(
+			settings,
+			"openviking.autoRetain",
+			openVikingEnvironmentBoolean("openviking.autoRetain", env),
+			boolFromUnknown(cc?.autoCapture),
+		),
 		recallLimit: intAtLeast(
-			openVikingEnvironmentNumber("openviking.recallLimit", env) ??
-				resolveConfigValue(configuredSetting(settings, "openviking.recallLimit"), cc?.recallLimit),
-			6,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.recallLimit",
+				openVikingEnvironmentNumber("openviking.recallLimit", env),
+				finiteNumberFromUnknown(cc?.recallLimit),
+			),
+			settings.get("openviking.recallLimit"),
 			1,
 		),
 		scoreThreshold: clamped(
-			openVikingEnvironmentNumber("openviking.scoreThreshold", env) ??
-				resolveConfigValue(configuredSetting(settings, "openviking.scoreThreshold"), cc?.scoreThreshold),
-			0.35,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.scoreThreshold",
+				openVikingEnvironmentNumber("openviking.scoreThreshold", env),
+				finiteNumberFromUnknown(cc?.scoreThreshold),
+			),
+			settings.get("openviking.scoreThreshold"),
 			0,
 			1,
 		),
 		minQueryLength: intAtLeast(
-			openVikingEnvironmentNumber("openviking.minQueryLength", env) ??
-				resolveConfigValue(configuredSetting(settings, "openviking.minQueryLength"), cc?.minQueryLength),
-			3,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.minQueryLength",
+				openVikingEnvironmentNumber("openviking.minQueryLength", env),
+				finiteNumberFromUnknown(cc?.minQueryLength),
+			),
+			settings.get("openviking.minQueryLength"),
 			1,
 		),
 		recallMaxContentChars: intAtLeast(
-			openVikingEnvironmentNumber("openviking.recallMaxContentChars", env) ??
-				resolveConfigValue(
-					configuredSetting(settings, "openviking.recallMaxContentChars"),
-					cc?.recallMaxContentChars,
-				),
-			500,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.recallMaxContentChars",
+				openVikingEnvironmentNumber("openviking.recallMaxContentChars", env),
+				finiteNumberFromUnknown(cc?.recallMaxContentChars),
+			),
+			settings.get("openviking.recallMaxContentChars"),
 			50,
 		),
 		recallTokenBudget: intAtLeast(
-			openVikingEnvironmentNumber("openviking.recallTokenBudget", env) ??
-				resolveConfigValue(configuredSetting(settings, "openviking.recallTokenBudget"), cc?.recallTokenBudget),
-			2_000,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.recallTokenBudget",
+				openVikingEnvironmentNumber("openviking.recallTokenBudget", env),
+				finiteNumberFromUnknown(cc?.recallTokenBudget),
+			),
+			settings.get("openviking.recallTokenBudget"),
 			200,
 		),
-		recallPreferAbstract:
-			openVikingEnvironmentBoolean("openviking.recallPreferAbstract", env) ??
-			resolveConfigValue(
-				configuredSetting(settings, "openviking.recallPreferAbstract"),
-				boolFromUnknown(cc?.recallPreferAbstract),
-			) ??
-			true,
+		recallPreferAbstract: resolveOpenVikingSetting(
+			settings,
+			"openviking.recallPreferAbstract",
+			openVikingEnvironmentBoolean("openviking.recallPreferAbstract", env),
+			boolFromUnknown(cc?.recallPreferAbstract),
+		),
 		recallContextTurns: intAtLeast(
-			resolveConfigValue(configuredSetting(settings, "openviking.recallContextTurns"), cc?.recallContextTurns),
-			6,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.recallContextTurns",
+				undefined,
+				finiteNumberFromUnknown(cc?.recallContextTurns),
+			),
+			settings.get("openviking.recallContextTurns"),
 			1,
 		),
-		captureAssistantTurns:
-			openVikingEnvironmentBoolean("openviking.captureAssistantTurns", env) ??
-			resolveConfigValue(
-				configuredSetting(settings, "openviking.captureAssistantTurns"),
-				boolFromUnknown(cc?.captureAssistantTurns),
-			) ??
-			true,
+		captureAssistantTurns: resolveOpenVikingSetting(
+			settings,
+			"openviking.captureAssistantTurns",
+			openVikingEnvironmentBoolean("openviking.captureAssistantTurns", env),
+			boolFromUnknown(cc?.captureAssistantTurns),
+		),
 		commitEveryNTurns: intAtLeast(
-			resolveConfigValue(configuredSetting(settings, "openviking.commitEveryNTurns"), cc?.commitEveryNTurns),
-			4,
+			resolveOpenVikingSetting(
+				settings,
+				"openviking.commitEveryNTurns",
+				undefined,
+				finiteNumberFromUnknown(cc?.commitEveryNTurns),
+			),
+			settings.get("openviking.commitEveryNTurns"),
 			1,
 		),
-		debug:
-			openVikingEnvironmentBoolean("openviking.debug", env) ??
-			resolveConfigValue(configuredSetting(settings, "openviking.debug"), boolFromUnknown(cc?.debug)) ??
-			false,
 	};
 }

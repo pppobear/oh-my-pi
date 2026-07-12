@@ -24,7 +24,6 @@ const config: OpenVikingConfig = {
 	recallContextTurns: 3,
 	captureAssistantTurns: true,
 	commitEveryNTurns: 2,
-	debug: false,
 };
 
 function fetchUntilAborted(_url: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> {
