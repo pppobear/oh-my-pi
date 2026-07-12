@@ -314,6 +314,68 @@ describe("SettingsSelectorComponent memory tab", () => {
 		}
 	});
 
+	it("shows a workspace-derived peer without persisting it as an explicit global peer", async () => {
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_PEER_ID: undefined,
+			OPENVIKING_CREDENTIAL_SOURCE: undefined,
+			OPENVIKING_CREDENTIALS_SOURCE: undefined,
+			OPENVIKING_CONFIG_FILE: "/tmp/omp-settings-selector-peer-missing-ov.conf",
+			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-settings-selector-peer-missing-ovcli.conf",
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			const effective = await loadOpenVikingConfig(settings);
+			expect(effective.peerSource).toBe("workspace");
+			expect(effective.peerId).not.toBeNull();
+
+			const comp = createSelector();
+			for (const ch of "openviking peer id") comp.handleInput(ch);
+			await waitForRender(comp, output => output.includes(effective.peerId!));
+			await Bun.sleep(0);
+			selectSearchResultByDescription(comp, "Overrides the workspace-derived peer");
+
+			comp.handleInput("\n");
+			const editor = renderPlain(comp);
+			expect(editor).toContain("Enter to save");
+			expect(editor).not.toContain(effective.peerId!);
+
+			comp.handleInput("\n");
+			expect(settings.isConfigured("openviking.peerId")).toBe(false);
+			expect(settings.get("openviking.peerId")).toBeUndefined();
+		} finally {
+			restoreEnvironment();
+		}
+	});
+
+	it("keeps CLI-sourced OpenViking connection settings editable despite stale credential environment", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-settings-openviking-cli-source-"));
+		const cliConfigPath = path.join(dir, "ovcli.conf");
+		await Bun.write(cliConfigPath, JSON.stringify({ url: "https://cli.openviking.test", api_key: "cli-secret" }));
+		const restoreEnvironment = replaceEnvironment({
+			OPENVIKING_URL: "https://stale-environment.test",
+			OPENVIKING_CREDENTIAL_SOURCE: "cli",
+			OPENVIKING_CREDENTIALS_SOURCE: undefined,
+			OPENVIKING_CONFIG_FILE: path.join(dir, "missing-ov.conf"),
+			OPENVIKING_CLI_CONFIG_FILE: cliConfigPath,
+		});
+		try {
+			settings.set("memory.backend", "openviking");
+			const comp = createSelector();
+			for (const ch of "openviking api url") comp.handleInput(ch);
+			const list = await waitForRender(comp, output => output.includes("https://cli.openviking.test"));
+			await Bun.sleep(0);
+			selectSearchResultByDescription(comp, "OpenViking server URL");
+
+			expect(list).not.toContain("OPENVIKING_URL");
+			expect(list).not.toContain("Controlled by");
+			comp.handleInput("\n");
+			expect(renderPlain(comp)).toContain("Enter to save");
+		} finally {
+			restoreEnvironment();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("shows and disables OpenViking values controlled by environment variables", async () => {
 		const restoreEnvironment = replaceEnvironment({
 			OPENVIKING_AUTO_RECALL: "false",

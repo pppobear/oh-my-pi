@@ -169,6 +169,13 @@ export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
 	/** Full system prompt sent to the model */
 	systemPrompt: string;
+	/**
+	 * Subagent-specific prompt block, excluding the runtime-generated harness,
+	 * project context, and memory backend instructions. Cold revival combines
+	 * this with the current runtime prompt so backend switches do not resurrect
+	 * stale memory guidance. Absent on older session files.
+	 */
+	subagentSystemPrompt?: string;
 	/** Initial task/user message */
 	task: string;
 	/** Tools available to the agent */

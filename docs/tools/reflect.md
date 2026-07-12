@@ -73,10 +73,11 @@ OpenViking:
 - Network
   - Hindsight: optional `PUT /v1/default/banks/{bank_id}` from `ensureBankExists(...)`, then `POST /v1/default/banks/{bank_id}/reflect`.
   - Mnemopi: none unless configured embedding or LLM providers are used by the local runtime during recall.
+  - OpenViking: the same remote search and optional content-read requests as `recall`: `POST /api/v1/search/recall`, `POST /api/v1/search/find`, and when needed `GET /api/v1/content/read`.
 - Session state
   - Reads session-held backend scope and config only. Does not update `lastRecallSnippet`, Hindsight mental-model cache, or retain queues.
 - Background work / cancellation
-  - Aborts through `untilAborted(...)` if the tool call signal is cancelled.
+  - Aborts through `untilAborted(...)` if the tool call signal is cancelled. OpenViking also forwards that signal into remote search and content-read requests.
 
 ## Limits & Caps
 - Tool availability requires `memory.backend` to be `"hindsight"`, `"mnemopi"`, or `"openviking"`; default `memory.backend` is `"off"`.

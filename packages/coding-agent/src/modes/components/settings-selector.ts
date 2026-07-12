@@ -857,7 +857,13 @@ export class SettingsSelectorComponent implements Component {
 		const description = environmentVariable
 			? `${def.description} Controlled by ${environmentVariable}; edit or unset that environment variable to change it.`
 			: def.description;
-		const editingValue = effectiveValue ?? currentValue;
+		// A workspace-derived peer is useful display context, but it is not an
+		// explicit setting value. Seeding the editor with it would turn a no-op
+		// Enter into a global peer override shared by every workspace.
+		const editingValue =
+			def.path === "openviking.peerId" && this.#openVikingEffectiveConfig?.peerSource === "workspace"
+				? currentValue
+				: (effectiveValue ?? currentValue);
 
 		switch (def.type) {
 			case "boolean":
@@ -1111,6 +1117,11 @@ export class SettingsSelectorComponent implements Component {
 			def.description,
 			this.#formatTextInputEditValue(def.path, currentValue),
 			value => {
+				const persistedValue = this.#formatTextInputEditValue(def.path, settings.get(def.path));
+				if (!this.#isSecretSetting(def.path) && value === persistedValue) {
+					wrappedDone();
+					return;
+				}
 				// Empty string clears the setting; undefined-typed string settings
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
 				this.#setSettingValue(def.path, value);

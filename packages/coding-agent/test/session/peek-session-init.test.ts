@@ -48,6 +48,7 @@ describe("SessionManager.peekSessionInit", () => {
 		manager.appendSessionInit({ systemPrompt: "first", task: "t1", tools: ["read"], spawns: "" });
 		manager.appendSessionInit({
 			systemPrompt: "second",
+			subagentSystemPrompt: "subagent role",
 			task: "t2",
 			tools: ["read", "bash", "yield"],
 			spawns: "task",
@@ -62,6 +63,7 @@ describe("SessionManager.peekSessionInit", () => {
 		expect(peek?.cwd).toBe(manager.getCwd());
 		// Latest init wins — the reviver must rebuild from the most recent contract.
 		expect(peek?.init?.systemPrompt).toBe("second");
+		expect(peek?.init?.subagentSystemPrompt).toBe("subagent role");
 		expect(peek?.init?.tools).toEqual(["read", "bash", "yield"]);
 		expect(peek?.init?.spawns).toBe("task");
 		expect(peek?.init?.readSummarize).toBe(false);

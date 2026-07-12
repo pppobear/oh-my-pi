@@ -9,7 +9,27 @@ import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
+import { MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES } from "../tools/builtin-names";
 import { createMCPProxyTools, createSubagentSettings } from "./executor";
+
+/** Merge persisted subagent identity with the memory contract active at revive time. */
+function mergePersistedSubagentPrompt(defaultPrompt: readonly string[], subagentSystemPrompt: string): string[] {
+	return defaultPrompt.length === 0
+		? [subagentSystemPrompt]
+		: [...defaultPrompt.slice(0, -1), subagentSystemPrompt, defaultPrompt[defaultPrompt.length - 1]];
+}
+
+/** Preserve persisted non-memory capabilities while deriving memory tools from the live backend. */
+function mergePersistedSubagentTools(
+	persistedToolNames: readonly string[],
+	currentToolNames: readonly string[],
+): string[] {
+	const memoryToolNames = new Set<string>(MEMORY_DEPENDENT_BUILTIN_TOOL_NAMES);
+	return [
+		...persistedToolNames.filter(name => !memoryToolNames.has(name)),
+		...currentToolNames.filter(name => memoryToolNames.has(name)),
+	];
+}
 
 /**
  * Ambient context the reviver needs at revive time. The top-level session is
@@ -54,12 +74,19 @@ export function createPersistedSubagentReviverFactory(
 		// is gone (isolated/merged worktree, moved dir): leave it transcript-only
 		// (history://) rather than resurrect a wrong or broken session.
 		if (!peek?.init) return undefined;
+		const init = peek.init;
+		const subagentSystemPrompt = init.subagentSystemPrompt;
+		// Older entries persist only a fully composed prompt, so backend-owned
+		// instructions cannot be separated from the immutable subagent contract.
+		// Keep those sessions transcript-only instead of pairing a stale prompt
+		// with the current backend's tools (or vice versa).
+		if (typeof subagentSystemPrompt !== "string") return undefined;
+		const persistedSubagentPrompt: string = subagentSystemPrompt;
 		try {
 			await fs.stat(peek.cwd);
 		} catch {
 			return undefined;
 		}
-		const init = peek.init;
 		// taskDepth drives real capability gating (task-spawn allowance, memory
 		// startup, …); derive it from the persisted parent chain rather than
 		// assuming a fixed level.
@@ -102,7 +129,7 @@ export function createPersistedSubagentReviverFactory(
 				toolNames: init.tools,
 				outputSchema: init.outputSchema,
 				requireYieldTool: true,
-				systemPrompt: () => [init.systemPrompt],
+				systemPrompt: defaultPrompt => mergePersistedSubagentPrompt(defaultPrompt, persistedSubagentPrompt),
 				// Old files predate persisted spawns: deny re-spawning rather than let
 				// createAgentSession default to wildcard ("*").
 				spawns: init.spawns ?? "",
@@ -115,7 +142,7 @@ export function createPersistedSubagentReviverFactory(
 			// Clamp the active set to the persisted list: createAgentSession's
 			// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 			// the original run didn't carry. Unknown/missing names are ignored.
-			await session.setActiveToolsByName([...init.tools, ...session.getMountedXdevToolNames()]);
+			await session.setActiveToolsByName(mergePersistedSubagentTools(init.tools, session.getEnabledToolNames()));
 			// Cold revives must drive registry status themselves — createAgentSession
 			// doesn't wire this generically (the live path does it in the executor).
 			// Without it the idle-TTL timer never clears on a turn and the lifecycle

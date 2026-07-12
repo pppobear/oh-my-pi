@@ -355,7 +355,7 @@ describe("retain.execute (OpenViking backend)", () => {
 			archiveUri: "viking://session/archive",
 			extracted: 2,
 		}));
-		registeredOpenVikingState = { saveMany } as unknown as OpenVikingSessionState;
+		registeredOpenVikingState = { isReady: true, saveMany } as unknown as OpenVikingSessionState;
 
 		const result = await MemoryRetainTool.createIf(makeSession(settings))?.execute("openviking-stored", {
 			items: [{ content: "one" }, { content: "two" }, { content: "three" }],
@@ -369,6 +369,7 @@ describe("retain.execute (OpenViking backend)", () => {
 	it("reports a bounded Phase 2 wait as queued", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		registeredOpenVikingState = {
+			isReady: true,
 			saveMany: vi.fn(async () => ({
 				status: "queued" as const,
 				taskId: "task-1",
@@ -389,6 +390,7 @@ describe("retain.execute (OpenViking backend)", () => {
 	it("distinguishes unavailable extraction status from a known queue", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		registeredOpenVikingState = {
+			isReady: true,
 			saveMany: vi.fn(async () => ({
 				status: "queued" as const,
 				taskId: "task-1",
@@ -412,6 +414,7 @@ describe("retain.execute (OpenViking backend)", () => {
 	it("does not claim stored when extraction completes with zero memories", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		registeredOpenVikingState = {
+			isReady: true,
 			saveMany: vi.fn(async () => ({
 				status: "completed" as const,
 				taskId: "task-1",
@@ -434,6 +437,7 @@ describe("retain.execute (OpenViking backend)", () => {
 	it("surfaces extraction failures", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		registeredOpenVikingState = {
+			isReady: true,
 			saveMany: vi.fn(async () => ({ status: "failed" as const, error: "OpenViking memory extraction failed" })),
 		} as unknown as OpenVikingSessionState;
 
@@ -690,7 +694,7 @@ describe("Mnemopi backend lifecycle", () => {
 		registeredMnemopiState = undefined;
 	});
 
-	it("dispose({ timeoutMs }) returns within the budget when consolidate stalls (#3641)", async () => {
+	it("backend stop preserves the dispose budget when consolidation stalls (#3641)", async () => {
 		const state = registerMnemopiState();
 		const retainMemory = state.getScopedRetainTarget().memory;
 		// Hold flushExtractions hostage longer than any reasonable shutdown budget
@@ -705,7 +709,7 @@ describe("Mnemopi backend lifecycle", () => {
 
 		const BUDGET_MS = 100;
 		const start = Bun.nanoseconds();
-		await state.dispose({ timeoutMs: BUDGET_MS });
+		await mnemopiBackend.stop?.({ session: state.session, consolidateTimeoutMs: BUDGET_MS });
 		const elapsedMs = (Bun.nanoseconds() - start) / 1_000_000;
 
 		// Dispose must surrender within the budget (plus a generous slack); the
@@ -1076,6 +1080,44 @@ describe("recall.execute", () => {
 	});
 });
 
+describe("recall.execute (OpenViking backend)", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredOpenVikingState = undefined;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		registeredOpenVikingState = undefined;
+	});
+
+	it("propagates the tool abort signal through search and content formatting", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const signal = new AbortController().signal;
+		const items = [
+			{
+				uri: "viking://user/memories/preferences/editor.md",
+				score: 0.9,
+				_sourceType: "memory" as const,
+			},
+		];
+		const search = vi.fn(async () => items);
+		const formatItems = vi.fn(async () => "- editor preference");
+		registeredOpenVikingState = {
+			isReady: true,
+			config: { recallLimit: 4 },
+			search,
+			formatItems,
+		} as unknown as OpenVikingSessionState;
+
+		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
+		await tool.execute("call-openviking-recall-signal", { query: "editor" }, signal);
+
+		expect(search).toHaveBeenCalledWith("editor", 4, signal);
+		expect(formatItems).toHaveBeenCalledWith(items, true, signal);
+	});
+});
+
 describe("recall.execute (Mnemopi backend)", () => {
 	beforeEach(() => {
 		resetSettingsForTest();
@@ -1341,6 +1383,48 @@ describe("reflect.execute", () => {
 		const tool = MemoryReflectTool.createIf(makeSession(settings))!;
 		const result = await tool.execute("call-7", { query: "anything" });
 		expect((result.content[0] as { text: string }).text).toBe("No relevant information found to reflect on.");
+	});
+});
+
+describe("reflect.execute (OpenViking backend)", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredOpenVikingState = undefined;
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		registeredOpenVikingState = undefined;
+	});
+
+	it("propagates the tool abort signal through search and content formatting", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const signal = new AbortController().signal;
+		const items = [
+			{
+				uri: "viking://user/memories/entities/project.md",
+				score: 0.8,
+				_sourceType: "memory" as const,
+			},
+		];
+		const search = vi.fn(async () => items);
+		const formatItems = vi.fn(async () => "- project context");
+		registeredOpenVikingState = {
+			isReady: true,
+			config: { recallLimit: 6 },
+			search,
+			formatItems,
+		} as unknown as OpenVikingSessionState;
+
+		const tool = MemoryReflectTool.createIf(makeSession(settings))!;
+		await tool.execute(
+			"call-openviking-reflect-signal",
+			{ query: "project decision", context: "current branch" },
+			signal,
+		);
+
+		expect(search).toHaveBeenCalledWith("project decision\n\nAdditional context:\ncurrent branch", 6, signal);
+		expect(formatItems).toHaveBeenCalledWith(items, true, signal);
 	});
 });
 

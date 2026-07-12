@@ -112,7 +112,13 @@ import {
 	obfuscateProviderContext,
 	SecretObfuscator,
 } from "./secrets";
-import { AgentSession, type PlanYolo, type Prewalk } from "./session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionDisposeOptions,
+	type MemoryBackendReconcilerStopOptions,
+	type PlanYolo,
+	type Prewalk,
+} from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
@@ -2834,7 +2840,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null);
 		{
 			const originalDispose = session.dispose.bind(session);
-			session.dispose = async () => {
+			session.dispose = async (disposeOptions: AgentSessionDisposeOptions = {}) => {
 				try {
 					// Reject new session work (eval starts) the moment disposal
 					// begins — the lifecycle await below opens an async gap before
@@ -2847,7 +2853,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// must NOT touch the global lifecycle.
 						await AgentLifecycleManager.global().dispose();
 					}
-					await originalDispose();
+					await originalDispose(disposeOptions);
 				} finally {
 					unregisterUnlessParked();
 					unsubscribeCredentialDisabled?.();
@@ -3014,13 +3020,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			alignChildMemoryBackendSelection();
 			const memoryBackend = await resolveMemoryBackend(settings);
+			if (session.isDisposed) return;
 			if (memoryBackend.id === "openviking" && !openVikingParentTranscriptIsCurrent()) {
 				appliedMemoryBackend = memoryBackend;
 				await refreshMemoryBackendRuntime(memoryBackend);
 				return;
 			}
-			await memoryBackend.start(memoryStartOptions());
 			appliedMemoryBackend = memoryBackend;
+			try {
+				await memoryBackend.start(memoryStartOptions());
+			} catch (error) {
+				if (appliedMemoryBackend === memoryBackend) appliedMemoryBackend = undefined;
+				throw error;
+			}
+			// A concurrent dispose may already have stopped and unpublished this
+			// backend. Backend start implementations guard every late publication
+			// boundary, so never restore it after beginDispose().
+			if (session.isDisposed) return;
 			if (memoryBackend.id === "openviking") await refreshMemoryBackendRuntime(memoryBackend);
 		};
 		const createMemoryRuntimeTools = async (): Promise<AgentTool[]> => {
@@ -3057,9 +3073,39 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		let initialMemoryStartupPromise: Promise<void> = Promise.resolve();
 		let pendingStalePromptFragments: string[] = [];
-		const stopAppliedMemoryBackend = async (refreshInactiveRuntime: boolean): Promise<void> => {
-			await initialMemoryStartupPromise;
+		let inFlightMemoryBackendStop: { backend: MemoryBackend; completion: Promise<void> } | undefined;
+		const waitForInFlightMemoryBackendStop = async (
+			stop: { backend: MemoryBackend; completion: Promise<void> },
+			consolidateTimeoutMs?: number,
+		): Promise<void> => {
+			if (stop.backend.id !== "mnemopi" || consolidateTimeoutMs === undefined || consolidateTimeoutMs <= 0) {
+				await stop.completion;
+				return;
+			}
+			const completed = await Promise.race([
+				stop.completion.then(() => true),
+				Bun.sleep(consolidateTimeoutMs).then(() => false),
+			]);
+			if (!completed) {
+				logger.warn("Mnemopi: in-flight backend stop exceeded shutdown budget; detaching to background", {
+					consolidateTimeoutMs,
+				});
+			}
+		};
+		const stopAppliedMemoryBackend = async (
+			refreshInactiveRuntime: boolean,
+			stopOptions?: MemoryBackendReconcilerStopOptions,
+		): Promise<void> => {
+			// Normal live reconfiguration remains serialized behind initial startup.
+			// Teardown must not wait forever on a provider/credential lookup; the
+			// backend was published before start and its late publication points all
+			// fail closed once beginDispose() marks the session disposed.
+			if (!session.isDisposed) await initialMemoryStartupPromise;
 			const previousBackend = appliedMemoryBackend;
+			if (!previousBackend && inFlightMemoryBackendStop) {
+				await waitForInFlightMemoryBackendStop(inFlightMemoryBackendStop, stopOptions?.consolidateTimeoutMs);
+				return;
+			}
 			const currentState = session.getOpenVikingSessionState();
 			const primaryState = currentState?.aliasOf ?? currentState;
 			const stalePromptFragments =
@@ -3072,8 +3118,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					: [];
 			if (stalePromptFragments.length > 0) pendingStalePromptFragments = [...new Set(stalePromptFragments)];
 			appliedMemoryBackend = undefined;
+			const stopRecord = previousBackend
+				? {
+						backend: previousBackend,
+						completion: Promise.resolve().then(async () => {
+							await previousBackend.stop?.({
+								session,
+								consolidateTimeoutMs: stopOptions?.consolidateTimeoutMs,
+							});
+						}),
+					}
+				: undefined;
+			if (stopRecord) inFlightMemoryBackendStop = stopRecord;
 			try {
-				await previousBackend?.stop?.({ session });
+				if (stopRecord) await stopRecord.completion;
 			} catch (error) {
 				// OpenViking deliberately detaches after a workspace-baseline
 				// persistence failure. Keep that transition fail-closed, but make
@@ -3088,6 +3146,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 				throw error;
+			} finally {
+				if (inFlightMemoryBackendStop === stopRecord) inFlightMemoryBackendStop = undefined;
 			}
 			if (refreshInactiveRuntime && previousBackend?.id === "openviking") {
 				await refreshMemoryBackendRuntime(previousBackend, stalePromptFragments);
@@ -3098,26 +3158,31 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			parentSession: liveParentSession,
 			relatedSessions: relatedMemorySessions,
 			suspend: async () => await stopAppliedMemoryBackend(true),
-			stop: async () => await stopAppliedMemoryBackend(false),
+			stop: async options => await stopAppliedMemoryBackend(false, options),
 			start: async ({ parentReconciled }) => {
 				if (!parentReconciled) await liveParentSession()?.waitForMemoryBackendReconcile();
 				if (session.isDisposed) return;
 
 				alignChildMemoryBackendSelection();
 				const nextBackend = await resolveMemoryBackend(settings);
+				if (session.isDisposed) return;
 				if (nextBackend.id === "openviking" && !openVikingParentTranscriptIsCurrent()) {
 					appliedMemoryBackend = nextBackend;
 					await refreshMemoryBackendRuntime(nextBackend, pendingStalePromptFragments);
+					if (session.isDisposed) return;
 					pendingStalePromptFragments = [];
 					return;
 				}
-				await nextBackend.start(memoryStartOptions());
 				appliedMemoryBackend = nextBackend;
-				if (session.isDisposed) {
-					await nextBackend.stop?.({ session });
-					appliedMemoryBackend = undefined;
-					return;
+				try {
+					await nextBackend.start(memoryStartOptions());
+				} catch (error) {
+					if (appliedMemoryBackend === nextBackend) appliedMemoryBackend = undefined;
+					throw error;
 				}
+				// Disposal may stop this pre-published backend without waiting for a
+				// stalled live reconcile. Backend start paths discard late state.
+				if (session.isDisposed) return;
 				try {
 					if (!(await refreshMemoryBackendRuntime(nextBackend, pendingStalePromptFragments))) {
 						throw new Error("OpenViking backend failed to start with the current configuration.");

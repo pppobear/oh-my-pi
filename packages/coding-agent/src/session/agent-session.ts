@@ -654,12 +654,16 @@ export interface AgentSessionDisposeOptions {
 	reason?: postmortem.Reason;
 }
 
+export interface MemoryBackendReconcilerStopOptions {
+	consolidateTimeoutMs?: number;
+}
+
 export interface MemoryBackendReconciler {
 	depth: number;
 	parentSession(): AgentSession | undefined;
 	relatedSessions(): readonly AgentSession[];
 	suspend?(): Promise<void>;
-	stop(): Promise<void>;
+	stop(options?: MemoryBackendReconcilerStopOptions): Promise<void>;
 	start(options: { parentReconciled: boolean }): Promise<void>;
 }
 
@@ -6496,8 +6500,12 @@ export class AgentSession {
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
+		const memoryBackendReconciler = this.#memoryBackendReconciler;
 		this.#memoryBackendReconciler = undefined;
-		await this.#memoryBackendReconcileQueue;
+		// Do not await a live reconcile here: provider or credential discovery may
+		// be stalled indefinitely. beginDispose() excludes this session from new
+		// coordination, while the reconciler stop below clears any already
+		// published backend and backend start paths reject late publication.
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
@@ -6575,6 +6583,16 @@ export class AgentSession {
 		// Clean up an empty session created by this session's /move so it doesn't accumulate.
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
+		// Memory startup is deliberately allowed to run in the background for
+		// non-OpenViking sessions. The reconciler owns that startup promise, so stop
+		// it after session_shutdown handlers have observed the live memory runtime,
+		// but before the generic state cleanup below. Otherwise a slow provider or
+		// config lookup can publish a fresh backend state after dispose clears it.
+		try {
+			await memoryBackendReconciler?.stop({ consolidateTimeoutMs: options.mnemopiConsolidateTimeoutMs });
+		} catch (error) {
+			logger.warn("Failed to stop memory backend during dispose", { error: String(error) });
+		}
 		if (!(await this.#flushOpenVikingMemoryForSessionTransition())) {
 			logger.warn("OpenViking: final session tail could not be flushed during dispose");
 		}

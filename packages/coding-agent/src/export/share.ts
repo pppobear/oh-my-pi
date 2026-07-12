@@ -159,6 +159,8 @@ function redactShareEntry(o: SecretObfuscator, entry: SessionEntry): SessionEntr
 			return {
 				...entry,
 				systemPrompt: o.obfuscate(entry.systemPrompt),
+				subagentSystemPrompt:
+					entry.subagentSystemPrompt === undefined ? undefined : o.obfuscate(entry.subagentSystemPrompt),
 				task: o.obfuscate(entry.task),
 				outputSchema: undefined,
 			};

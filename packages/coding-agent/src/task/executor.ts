@@ -2400,6 +2400,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// the same JSONL file re-invokes createAgentSession with the exact options
 			// of the original run (same agent id, tools, model, system prompt,
 			// artifacts dir) — only the SessionManager differs.
+			const subagentSystemPrompt = prompt.render(subagentSystemPromptTemplate, {
+				agent: agent.systemPrompt,
+				context: options.context?.trim() ?? "",
+				planReference: options.planReference?.content ?? "",
+				planReferencePath: options.planReference?.path ?? "",
+				worktree: worktree ?? "",
+				outputSchema: normalizedOutputSchema,
+				outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
+				ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
+				ircSelfId: ircEnabled ? id : "",
+			});
 			const buildSubagentSessionOptions = (sessionManagerForRun: SessionManager): CreateAgentSessionOptions => ({
 				cwd: worktree ?? cwd,
 				authStorage,
@@ -2423,20 +2434,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				preloadedExtensionPaths: options.preloadedExtensionPaths,
 				preloadedCustomToolPaths: options.preloadedCustomToolPaths,
 				systemPrompt: defaultPrompt => {
-					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-						agent: agent.systemPrompt,
-						context: options.context?.trim() ?? "",
-						planReference: options.planReference?.content ?? "",
-						planReferencePath: options.planReference?.path ?? "",
-						worktree: worktree ?? "",
-						outputSchema: normalizedOutputSchema,
-						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
-						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
-						ircSelfId: ircEnabled ? id : "",
-					});
 					return defaultPrompt.length === 0
-						? [subagentPrompt]
-						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
+						? [subagentSystemPrompt]
+						: [...defaultPrompt.slice(0, -1), subagentSystemPrompt, defaultPrompt[defaultPrompt.length - 1]];
 				},
 				sessionManager: sessionManagerForRun,
 				hasUI: false,
@@ -2525,6 +2525,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
+				subagentSystemPrompt,
 				task,
 				tools: session.getActiveToolNames(),
 				spawns: spawnsEnv,

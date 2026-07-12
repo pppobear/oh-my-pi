@@ -21,6 +21,10 @@ const SECRET_ENV_KEYS = [
 	"OPENVIKING_USER",
 	"OMP_AUTH_BROKER_TOKEN",
 	"HINDSIGHT_API_TOKEN",
+	"MNEMOPI_EMBEDDING_API_KEY",
+	"MNEMOPI_LLM_API_KEY",
+	"OPENROUTER_API_KEY",
+	"OPENAI_API_KEY",
 	"SEARXNG_TOKEN",
 	"SEARXNG_BASIC_PASSWORD",
 	"PI_AUTO_QA_PUSH_TOKEN",
@@ -356,5 +360,29 @@ describe("config CLI schema coverage", () => {
 		expect(outputs.join("\n")).not.toContain(hiddenSecret);
 		expect(outputs.join("\n")).not.toContain(hindsightSettingSecret);
 		expect(outputs.join("\n")).not.toContain(hindsightEnvironmentSecret);
+	});
+
+	it("reports Mnemopi secrets configured through their runtime environment fallbacks", async () => {
+		using _environment = isolateSecretEnvironment();
+		await initTheme();
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const outputs: string[] = [];
+		const getText = async (key: "mnemopi.embeddingApiKey" | "mnemopi.llmApiKey"): Promise<string> => {
+			logSpy.mockClear();
+			await runConfigCommand({ action: "get", key, flags: {} });
+			const output = logSpy.mock.calls.map(call => String(call[0] ?? "")).join("\n");
+			outputs.push(output);
+			return Bun.stripANSI(output);
+		};
+
+		for (const name of ["MNEMOPI_EMBEDDING_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"] as const) {
+			Bun.env[name] = `${name.toLowerCase()}-secret`;
+			expect(await getText("mnemopi.embeddingApiKey")).toBe("(configured)");
+			delete Bun.env[name];
+		}
+
+		Bun.env.MNEMOPI_LLM_API_KEY = "mnemopi-llm-secret";
+		expect(await getText("mnemopi.llmApiKey")).toBe("(configured)");
+		expect(outputs.join("\n")).not.toContain("secret");
 	});
 });

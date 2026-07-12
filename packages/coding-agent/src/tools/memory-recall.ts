@@ -69,7 +69,7 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 					throw new Error("OpenViking backend is not initialised for this session.");
 				}
 				try {
-					const results = await primary.search(params.query, primary.config.recallLimit);
+					const results = await primary.search(params.query, primary.config.recallLimit, signal);
 					if (results.length === 0) {
 						return {
 							content: [{ type: "text", text: "No relevant memories found." }],
@@ -77,7 +77,7 @@ export class MemoryRecallTool implements AgentTool<typeof memoryRecallSchema> {
 							useless: true,
 						};
 					}
-					const formatted = await primary.formatItems(results, true);
+					const formatted = await primary.formatItems(results, true, signal);
 					return {
 						content: [
 							{

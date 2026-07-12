@@ -1581,6 +1581,7 @@ export class SessionManager {
 
 	appendSessionInit(init: {
 		systemPrompt: string;
+		subagentSystemPrompt?: string;
 		task: string;
 		tools: string[];
 		outputSchema?: unknown;
@@ -2021,6 +2022,7 @@ export class SessionManager {
 		cwd: string;
 		init: {
 			systemPrompt: string;
+			subagentSystemPrompt?: string;
 			task: string;
 			tools: string[];
 			outputSchema?: unknown;
@@ -2041,6 +2043,7 @@ export class SessionManager {
 		const header = loaded.find(entry => entry.type === "session") as SessionHeader | undefined;
 		let init: {
 			systemPrompt: string;
+			subagentSystemPrompt?: string;
 			task: string;
 			tools: string[];
 			outputSchema?: unknown;
@@ -2054,6 +2057,9 @@ export class SessionManager {
 			if (entry.type === "session_init") {
 				init = {
 					systemPrompt: entry.systemPrompt,
+					...(entry.subagentSystemPrompt !== undefined
+						? { subagentSystemPrompt: entry.subagentSystemPrompt }
+						: {}),
 					task: entry.task,
 					tools: entry.tools,
 					outputSchema: entry.outputSchema,

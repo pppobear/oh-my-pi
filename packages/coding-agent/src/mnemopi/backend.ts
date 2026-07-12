@@ -72,18 +72,25 @@ export const mnemopiBackend: MemoryBackend = {
 
 		if (options.taskDepth > 0) {
 			const parent = getMnemopiSessionStateFromParent(options);
-			if (!parent) return;
-			const previous = setMnemopiSessionState(
+			if (!parent || session.isDisposed) return;
+			const state = new MnemopiSessionState({
+				sessionId,
+				config: parent.config,
 				session,
-				new MnemopiSessionState({
-					sessionId,
-					config: parent.config,
-					session,
-					aliasOf: parent,
-					hasRecalledForFirstTurn: true,
-				}),
-			);
+				aliasOf: parent,
+				hasRecalledForFirstTurn: true,
+			});
+			const previous = setMnemopiSessionState(session, state);
 			await previous?.dispose();
+			if (getMnemopiSessionState(session) !== state) {
+				// A concurrent teardown owns disposal after clearing the published
+				// state; do not start a second unbounded consolidation in the detached
+				// startup task.
+				if (!session.isDisposed) await state.dispose();
+				return;
+			}
+			// Leave a state installed after beginDispose() for the reconciler-owned
+			// stop path, which carries the caller's consolidation timeout.
 			return;
 		}
 
@@ -93,6 +100,7 @@ export const mnemopiBackend: MemoryBackend = {
 				const liveSessionId = session.sessionId;
 				if (!liveSessionId) return;
 				const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, liveSessionId);
+				if (session.isDisposed) return;
 				// Session transitions rekey an installed state synchronously, but they
 				// cannot rekey a candidate still waiting on credential/provider setup.
 				// Retry against the live id instead of publishing a stale candidate.
@@ -102,9 +110,11 @@ export const mnemopiBackend: MemoryBackend = {
 				const previous = setMnemopiSessionState(session, state);
 				await previous?.dispose();
 				if (getMnemopiSessionState(session) !== state) {
-					await state.dispose();
+					if (!session.isDisposed) await state.dispose();
 					return;
 				}
+				// Disposal will stop this published state with its configured budget.
+				if (session.isDisposed) return;
 				state.attachSessionListeners();
 				return;
 			}
@@ -113,9 +123,9 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 	},
 
-	async stop({ session }): Promise<void> {
+	async stop({ session, consolidateTimeoutMs }): Promise<void> {
 		const state = setMnemopiSessionState(session, undefined);
-		await state?.dispose();
+		await state?.dispose({ timeoutMs: consolidateTimeoutMs });
 	},
 
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {

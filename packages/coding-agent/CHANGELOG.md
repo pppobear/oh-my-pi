@@ -223,12 +223,14 @@
 ## [16.4.6] - 2026-07-12
 ### Added
 
-- Added `memory.backend: openviking` for OpenViking-backed recall/retain, first-turn prompt injection, session capture, `/memory` status/search/save, and subagent memory aliasing.
+- Added `memory.backend: openviking` for OpenViking-backed recall/retain, per-turn recalled context, session capture, `/memory` status/search/save, and subagent memory aliasing.
 - Added OpenViking document reads through existing `memory://` internal URLs when the OpenViking backend is active.
 
 ### Fixed
 
-- Scoped OpenViking recall and retained messages to a workspace-derived peer by default, including the v0.4.9 peer-aware recall endpoint, an opt-in all-peer recall mode, safe migration of existing unscoped cursors, non-replaying workspace moves across derived or explicit peers, current `ovcli.conf`/`ov.conf` peer aliases, accurate effective settings display, explicit peer overrides, and an opt-out.
+- Scoped OpenViking recall and retained messages to a collision-resistant workspace-derived peer by default, including the v0.4.9 peer-aware recall endpoint, an opt-in all-peer recall mode, safe migration of existing unscoped cursors, replay migration from path-derived peers, non-replaying workspace moves across derived or explicit peers, current `ovcli.conf`/`ov.conf` peer aliases, accurate effective settings display, explicit peer overrides, and an opt-out.
+- Hardened OpenViking protocol handling by rejecting malformed successful responses, preserving the safe actor-header fallback for OpenViking 0.4.8's exact `peer_scope` extra-field rejection while failing closed for other actor-scope failures, treating recalled server content as untrusted data, degrading optional skill enrichment independently, and propagating search cancellation into remote requests.
+- Made memory backend startup and live reconciliation disposal-safe without unbounded shutdown waits, rebuilt newly persisted subagents from the current memory backend contract, and kept legacy sessions transcript-only when their prompt ownership cannot be separated safely.
 - Fixed OpenViking write completion reporting by tracking asynchronous extraction tasks after synchronous archival, reconciling lost commit acknowledgements through persisted task baselines, reserving `stored` for completed non-empty extraction, boundedly waiting for explicit retains while keeping automatic capture in the background, and rejecting unsupported `/memory clear` operations without detaching live state.
 - Made OpenViking capture resumable across crashes and partial add/commit failures, and prevented session transitions or clears from silently dropping or uploading the wrong transcript tail.
 - Reconciled live OpenViking setting changes across parent and subagent sessions, including credentials, listeners, tools, and memory instructions before the next prompt.

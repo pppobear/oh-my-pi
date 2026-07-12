@@ -380,6 +380,35 @@ describe("OpenViking configuration profiles", () => {
 		expect(getOpenVikingEnvironmentVariable("openviking.autoRecall", env)).toBeUndefined();
 	});
 
+	it("does not report ignored environment credentials when CLI credential mode is selected", () => {
+		const env = {
+			OPENVIKING_CREDENTIAL_SOURCE: "cli",
+			OPENVIKING_URL: "https://ignored.openviking.test",
+			OPENVIKING_API_KEY: "ignored-secret",
+			OPENVIKING_ACCOUNT: "ignored-account",
+			OPENVIKING_USER: "ignored-user",
+			OPENVIKING_PEER_ID: "ignored-peer",
+			OPENVIKING_AUTO_RECALL: "false",
+		};
+
+		for (const path of [
+			"openviking.apiUrl",
+			"openviking.apiKey",
+			"openviking.account",
+			"openviking.user",
+			"openviking.peerId",
+		] as const) {
+			expect(getOpenVikingEnvironmentVariable(path, env)).toBeUndefined();
+		}
+		expect(getOpenVikingEnvironmentVariable("openviking.autoRecall", env)).toBe("OPENVIKING_AUTO_RECALL");
+		expect(
+			getOpenVikingEnvironmentVariable("openviking.apiKey", {
+				...env,
+				OPENVIKING_CREDENTIAL_SOURCE: "env",
+			}),
+		).toBe("OPENVIKING_API_KEY");
+	});
+
 	it("derives a workspace peer by default and supports explicit override or opt-out", async () => {
 		const settings = Settings.isolated();
 		const missingProfiles = {
@@ -387,7 +416,13 @@ describe("OpenViking configuration profiles", () => {
 			OPENVIKING_CLI_CONFIG_FILE: "/tmp/omp-openviking-workspace-peer-missing-cli.conf",
 		};
 
-		expect(deriveOpenVikingWorkspacePeerId("/Users/x/Dev/OpenViking")).toBe("-Users-x-Dev-OpenViking");
+		const readablePeer = deriveOpenVikingWorkspacePeerId(path.join(os.tmpdir(), "Dev", "OpenViking"));
+		expect(readablePeer).toMatch(/^omp-ws-v1-openviking-[a-f0-9]{20}$/);
+		expect(deriveOpenVikingWorkspacePeerId(path.join(os.tmpdir(), "Dev", "OpenViking"))).toBe(readablePeer);
+		expect(deriveOpenVikingWorkspacePeerId("/tmp/foo/bar")).not.toBe(deriveOpenVikingWorkspacePeerId("/tmp/foo-bar"));
+		expect(deriveOpenVikingWorkspacePeerId("/tmp/foo/../foo/bar")).toBe(
+			deriveOpenVikingWorkspacePeerId("/tmp/foo/bar"),
+		);
 		expect((await loadOpenVikingConfig(settings, missingProfiles)).peerId).toBe(
 			deriveOpenVikingWorkspacePeerId(settings.getCwd()),
 		);

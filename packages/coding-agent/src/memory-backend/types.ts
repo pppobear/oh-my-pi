@@ -97,6 +97,8 @@ export interface MemoryBackendStartOptions {
 
 export interface MemoryBackendStopOptions {
 	session: AgentSession;
+	/** Optional bound for backend consolidation during process/session teardown. */
+	consolidateTimeoutMs?: number;
 }
 
 export interface MemoryBackend {

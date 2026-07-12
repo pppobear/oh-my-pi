@@ -93,6 +93,16 @@ export interface OpenVikingMessagePayload {
 	peer_id?: string;
 }
 
+export interface OpenVikingSessionSnapshot {
+	session_id: string;
+	[key: string]: unknown;
+}
+
+export interface OpenVikingMessageAccepted {
+	session_id: string;
+	message_count: number;
+}
+
 const MEMORY_SEARCH_SOURCE: OpenVikingSearchSource = {
 	type: "memory",
 	uri: "viking://user/memories",
@@ -123,29 +133,46 @@ export class OpenVikingApi {
 		return await this.#request("/ready", {}, { parseJson: false });
 	}
 
-	async getSession(sessionId: string, autoCreate: boolean): Promise<OpenVikingFetchResult<unknown>> {
+	async getSession(sessionId: string, autoCreate: boolean): Promise<OpenVikingFetchResult<OpenVikingSessionSnapshot>> {
 		const autoCreateParam = autoCreate ? "true" : "false";
-		return await this.#request(`/api/v1/sessions/${encodeURIComponent(sessionId)}?auto_create=${autoCreateParam}`);
+		const response = await this.#request<unknown>(
+			`/api/v1/sessions/${encodeURIComponent(sessionId)}?auto_create=${autoCreateParam}`,
+		);
+		if (!response.ok) return fetchFailure(response);
+		const parsed = parseSessionSnapshot(response.result, sessionId);
+		if (!parsed.ok) return { ok: false, status: response.status, error: parsed.error };
+		return { ok: true, status: response.status, result: parsed.value };
 	}
 
-	async ensureSession(sessionId: string): Promise<OpenVikingFetchResult<unknown>> {
+	async ensureSession(sessionId: string): Promise<OpenVikingFetchResult<OpenVikingSessionSnapshot>> {
 		return await this.getSession(sessionId, true);
 	}
 
-	async search(query: string, limit: number = this.#config.recallLimit): Promise<OpenVikingSearchItem[]> {
+	async search(
+		query: string,
+		limit: number = this.#config.recallLimit,
+		signal?: AbortSignal,
+	): Promise<OpenVikingSearchItem[]> {
+		signal?.throwIfAborted();
 		const [recalledMemories, skills] = await Promise.all([
-			this.#recallMemories(query, limit),
-			this.#searchOneSource(query, SKILL_SEARCH_SOURCE, limit),
+			this.#recallMemories(query, limit, signal),
+			this.#searchOneSource(query, SKILL_SEARCH_SOURCE, limit, signal).catch(() => {
+				signal?.throwIfAborted();
+				return [];
+			}),
 		]);
+		signal?.throwIfAborted();
 		if (recalledMemories) {
 			return mergeServerRankedRecall(recalledMemories, skills, query).slice(0, limit);
 		}
-		const legacyMemories = await this.#searchOneSource(query, MEMORY_SEARCH_SOURCE, Math.max(limit * 2, 8));
+		const legacyMemories = await this.#searchOneSource(query, MEMORY_SEARCH_SOURCE, Math.max(limit * 2, 8), signal);
+		signal?.throwIfAborted();
 		return dedupeAndRank([...legacyMemories, ...skills], query).slice(0, limit);
 	}
 
-	async readContent(uri: string): Promise<string | null> {
-		const response = await this.#request<string>(`/api/v1/content/read?uri=${encodeURIComponent(uri)}`);
+	async readContent(uri: string, signal?: AbortSignal): Promise<string | null> {
+		const response = await this.#request<string>(`/api/v1/content/read?uri=${encodeURIComponent(uri)}`, { signal });
+		signal?.throwIfAborted();
 		if (response.ok) {
 			if (typeof response.result === "string") return response.result;
 			throw new Error("OpenViking read content failed: response did not contain text");
@@ -154,9 +181,12 @@ export class OpenVikingApi {
 		throw openVikingRequestError("read content", response);
 	}
 
-	async addMessage(sessionId: string, payload: OpenVikingMessagePayload): Promise<OpenVikingFetchResult<unknown>> {
+	async addMessage(
+		sessionId: string,
+		payload: OpenVikingMessagePayload,
+	): Promise<OpenVikingFetchResult<OpenVikingMessageAccepted>> {
 		const body = this.#config.peerId && !payload.peer_id ? { ...payload, peer_id: this.#config.peerId } : payload;
-		return await this.#request(
+		const response = await this.#request<unknown>(
 			`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
 			{
 				method: "POST",
@@ -164,6 +194,10 @@ export class OpenVikingApi {
 			},
 			{ timeoutMs: this.#config.captureTimeoutMs },
 		);
+		if (!response.ok) return fetchFailure(response);
+		const parsed = parseMessageAccepted(response.result, sessionId);
+		if (!parsed.ok) return { ok: false, status: response.status, error: parsed.error };
+		return { ok: true, status: response.status, result: parsed.value };
 	}
 
 	async commitSession(sessionId: string): Promise<OpenVikingFetchResult<OpenVikingCommitStart>> {
@@ -254,7 +288,13 @@ export class OpenVikingApi {
 			attempted = true;
 			if (options.signal?.aborted) return { status: "aborted", task: lastTask };
 			if (!response.ok || !response.result) {
-				if (performance.now() - startedAt >= timeoutMs) return { status: "timeout", task: lastTask };
+				// #getTask is bounded by the exact remaining deadline. Its internal
+				// timer can abort fetch a fraction before performance.now() observes the
+				// same boundary; with no external abort, that is still a total-wait
+				// timeout rather than an unknown request failure.
+				if (isAbortedRequest(response) || performance.now() - startedAt >= timeoutMs) {
+					return { status: "timeout", task: lastTask };
+				}
 				return {
 					status: "unknown",
 					reason: classifyUnknownTaskResponse(response),
@@ -321,6 +361,7 @@ export class OpenVikingApi {
 		query: string,
 		source: OpenVikingSearchSource,
 		limit: number,
+		signal?: AbortSignal,
 	): Promise<OpenVikingSearchItem[]> {
 		const body = {
 			query,
@@ -331,7 +372,9 @@ export class OpenVikingApi {
 		const response = await this.#request<Record<string, unknown>>("/api/v1/search/find", {
 			method: "POST",
 			body: JSON.stringify(body),
+			signal,
 		});
+		signal?.throwIfAborted();
 		if (!response.ok) throw openVikingRequestError(`search ${source.type}`, response);
 		if (!response.result || typeof response.result !== "object") {
 			throw new Error(`OpenViking search ${source.type} failed: response did not contain a result object`);
@@ -344,7 +387,7 @@ export class OpenVikingApi {
 			.filter(item => item.uri.length > 0);
 	}
 
-	async #recallMemories(query: string, limit: number): Promise<OpenVikingSearchItem[] | null> {
+	async #recallMemories(query: string, limit: number, signal?: AbortSignal): Promise<OpenVikingSearchItem[] | null> {
 		const body: Record<string, unknown> = {
 			query,
 			quotas: buildRecallQuotas(limit),
@@ -354,20 +397,30 @@ export class OpenVikingApi {
 		};
 		if (this.#config.recallPeerScope === "actor") body.peer_scope = "actor";
 
+		const requiresActorPeerIsolation = this.#config.recallPeerScope === "actor" && this.#config.peerId !== null;
 		let response = await this.#request<unknown>("/api/v1/search/recall", {
 			method: "POST",
 			body: JSON.stringify(body),
+			signal,
 		});
-		if (!response.ok && body.peer_scope && isRecallPeerScopeCompatibilityStatus(response.status)) {
-			const downgradedBody = { ...body };
-			delete downgradedBody.peer_scope;
+		signal?.throwIfAborted();
+		if (!response.ok && body.peer_scope && isLegacyRecallPeerScopeRejection(response)) {
+			const legacyBody = { ...body };
+			delete legacyBody.peer_scope;
 			response = await this.#request<unknown>("/api/v1/search/recall", {
 				method: "POST",
-				body: JSON.stringify(downgradedBody),
+				body: JSON.stringify(legacyBody),
+				signal,
 			});
+			signal?.throwIfAborted();
 		}
 		if (!response.ok) {
-			if (isMissingRecallEndpointStatus(response.status)) return null;
+			if (isMissingRecallEndpointStatus(response.status) && !requiresActorPeerIsolation) return null;
+			if (isMissingRecallEndpointStatus(response.status)) {
+				throw new Error(
+					"OpenViking actor-scoped recall is unavailable; refusing an unscoped legacy search fallback",
+				);
+			}
 			throw openVikingRequestError("recall", response);
 		}
 		const parsed = parseRecallEntries(response.result);
@@ -417,11 +470,34 @@ export class OpenVikingApi {
 			if (options.parseJson === false) {
 				return { ok: response.ok, status: response.status };
 			}
-			const body = (await response.json().catch(() => ({}))) as { status?: unknown; result?: T; error?: unknown };
+			let body: unknown;
+			try {
+				body = await response.json();
+			} catch {
+				return {
+					ok: false,
+					status: response.status,
+					error: `Invalid OpenViking response: expected a JSON envelope (HTTP ${response.status})`,
+				};
+			}
+			if (!isRecord(body)) {
+				return {
+					ok: false,
+					status: response.status,
+					error: `Invalid OpenViking response: expected an object envelope (HTTP ${response.status})`,
+				};
+			}
 			if (!response.ok || body.status === "error") {
 				return { ok: false, status: response.status, error: formatOpenVikingError(body.error, response.status) };
 			}
-			return { ok: true, status: response.status, result: body.result ?? (body as T) };
+			if (body.status !== "ok" || !Object.hasOwn(body, "result")) {
+				return {
+					ok: false,
+					status: response.status,
+					error: `Invalid OpenViking response: expected status=ok with a result field (HTTP ${response.status})`,
+				};
+			}
+			return { ok: true, status: response.status, result: body.result as T };
 		} catch (error) {
 			return { ok: false, error: error instanceof Error ? error.message : String(error) };
 		} finally {
@@ -432,6 +508,38 @@ export class OpenVikingApi {
 }
 
 type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+function parseSessionSnapshot(value: unknown, expectedSessionId: string): ParseResult<OpenVikingSessionSnapshot> {
+	if (!isRecord(value)) {
+		return { ok: false, error: "Invalid OpenViking session response: expected an object" };
+	}
+	if (value.session_id !== expectedSessionId) {
+		return {
+			ok: false,
+			error: `Invalid OpenViking session response: expected session_id ${expectedSessionId}`,
+		};
+	}
+	return { ok: true, value: { ...value, session_id: expectedSessionId } };
+}
+
+function parseMessageAccepted(value: unknown, expectedSessionId: string): ParseResult<OpenVikingMessageAccepted> {
+	if (!isRecord(value)) {
+		return { ok: false, error: "Invalid OpenViking add-message response: expected an object" };
+	}
+	if (value.session_id !== expectedSessionId) {
+		return {
+			ok: false,
+			error: `Invalid OpenViking add-message response: expected session_id ${expectedSessionId}`,
+		};
+	}
+	if (typeof value.message_count !== "number" || !Number.isInteger(value.message_count) || value.message_count < 1) {
+		return {
+			ok: false,
+			error: "Invalid OpenViking add-message response: message_count must be a positive integer",
+		};
+	}
+	return { ok: true, value: { session_id: expectedSessionId, message_count: value.message_count } };
+}
 
 function parseCommitStart(value: unknown): ParseResult<OpenVikingCommitStart> {
 	if (!isRecord(value)) return { ok: false, error: "Invalid OpenViking commit response: expected an object" };
@@ -602,8 +710,14 @@ function isTaskStatus(value: unknown): value is OpenVikingTaskStatus {
 	return value === "pending" || value === "running" || value === "completed" || value === "failed";
 }
 
-function isRecallPeerScopeCompatibilityStatus(status: number | undefined): boolean {
-	return status === 400 || status === 422;
+function isLegacyRecallPeerScopeRejection(response: OpenVikingFetchResult<unknown>): boolean {
+	if (response.status !== 400 && response.status !== 422) return false;
+	const detail = response.error?.toLowerCase();
+	return detail?.includes("body.peer_scope") === true && detail.includes("extra inputs are not permitted");
+}
+
+function isAbortedRequest(response: OpenVikingFetchResult<unknown>): boolean {
+	return response.status === undefined && response.error?.toLowerCase().includes("abort") === true;
 }
 
 function isMissingRecallEndpointStatus(status: number | undefined): boolean {

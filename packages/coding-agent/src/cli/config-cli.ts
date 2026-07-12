@@ -155,6 +155,8 @@ function formatValue(value: unknown): string {
 const SECRET_SETTING_ENVIRONMENT: Partial<Record<SettingPath, readonly string[]>> = {
 	"auth.broker.token": ["OMP_AUTH_BROKER_TOKEN"],
 	"hindsight.apiToken": ["HINDSIGHT_API_TOKEN"],
+	"mnemopi.embeddingApiKey": ["MNEMOPI_EMBEDDING_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+	"mnemopi.llmApiKey": ["MNEMOPI_LLM_API_KEY"],
 	"searxng.token": ["SEARXNG_TOKEN"],
 	"searxng.basicPassword": ["SEARXNG_BASIC_PASSWORD"],
 	"dev.autoqaPush.token": ["PI_AUTO_QA_PUSH_TOKEN"],

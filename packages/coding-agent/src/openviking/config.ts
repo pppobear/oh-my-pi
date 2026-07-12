@@ -204,6 +204,14 @@ const OPENVIKING_ENVIRONMENT_SETTINGS: Partial<Record<SettingPath, OpenVikingEnv
 	"openviking.debug": { names: ["OPENVIKING_DEBUG"], parse: boolFromUnknown },
 };
 
+const OPENVIKING_CREDENTIAL_SETTING_PATHS = new Set<SettingPath>([
+	"openviking.apiUrl",
+	"openviking.apiKey",
+	"openviking.account",
+	"openviking.user",
+	"openviking.peerId",
+]);
+
 function resolveOpenVikingEnvironmentSetting(
 	path: SettingPath,
 	env: NodeJS.ProcessEnv,
@@ -221,6 +229,9 @@ export function getOpenVikingEnvironmentVariable(
 	path: SettingPath,
 	env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
+	if (credentialSourceFromEnvironment(env) === "cli" && OPENVIKING_CREDENTIAL_SETTING_PATHS.has(path)) {
+		return undefined;
+	}
 	return resolveOpenVikingEnvironmentSetting(path, env)?.name;
 }
 
@@ -281,7 +292,19 @@ function looksLikeOpenVikingCliConfig(value: unknown): value is OpenVikingCliCon
 }
 
 export function deriveOpenVikingWorkspacePeerId(cwd: string): string {
-	return cwd.replace(/[^A-Za-z0-9]/g, "-");
+	const canonicalCwd = path.resolve(cwd);
+	const readableName =
+		path
+			.basename(canonicalCwd)
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(0, 24) || "root";
+	const digest = new Bun.CryptoHasher("sha256")
+		.update(`openviking-workspace-peer-v1\0${canonicalCwd}`)
+		.digest("hex")
+		.slice(0, 20);
+	return `omp-ws-v1-${readableName}-${digest}`;
 }
 
 export async function loadOpenVikingConfig(

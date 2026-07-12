@@ -1,7 +1,8 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { composeRecallQuery, truncateRecallQuery } from "../hindsight/content";
 import { extractMessages } from "../hindsight/transcript";
+import openVikingContextTemplate from "../prompts/system/openviking-context.md" with { type: "text" };
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import { SESSION_CWD_TRANSITION_CUSTOM_TYPE } from "../session/session-entries";
 import type {
@@ -18,8 +19,6 @@ const kOpenVikingSessionState = Symbol("openviking.sessionState");
 const OPENVIKING_SESSION_PREFIX = "omp-";
 const OPENVIKING_CAPTURE_CURSOR_TYPE = "openviking-capture-cursor";
 const OPENVIKING_CAPTURE_CURSOR_VERSION = 4;
-const OPENVIKING_CONTEXT_HEADER =
-	"Relevant context from OpenViking. Use recall or read MCP tools to expand memory:// URIs.";
 
 type CapturedRole = "user" | "assistant";
 
@@ -295,19 +294,23 @@ export class OpenVikingSessionState {
 	}
 
 	async recallForContext(query: string): Promise<string | undefined> {
+		const signal = this.#monitorAbortController.signal;
 		try {
-			const items = await this.client.search(query, this.config.recallLimit);
+			const items = await this.client.search(query, this.config.recallLimit, signal);
 			const filtered = items.filter(item => (item.score ?? 0) >= this.config.scoreThreshold);
-			return await this.formatItems(filtered);
+			return await this.formatItems(filtered, false, signal);
 		} catch (error) {
+			if (signal.aborted) return undefined;
 			logger.warn("OpenViking: recall failed", { sessionId: this.sessionId, error: String(error) });
 			return undefined;
 		}
 	}
 
-	async search(query: string, limit: number): Promise<OpenVikingSearchItem[]> {
+	async search(query: string, limit: number, signal?: AbortSignal): Promise<OpenVikingSearchItem[]> {
 		if (!this.isReady) return [];
-		const items = await this.client.search(query, limit);
+		const operationSignal = this.#operationSignal(signal);
+		operationSignal.throwIfAborted();
+		const items = await this.client.search(query, limit, operationSignal);
 		return this.isReady ? items.filter(item => (item.score ?? 0) >= this.config.scoreThreshold) : [];
 	}
 
@@ -1016,7 +1019,9 @@ export class OpenVikingSessionState {
 							"OpenViking",
 						);
 					}
-					await Bun.sleep(Math.min(30_000, Math.max(1_000, this.config.captureTimeoutMs)));
+					if (!(await sleepWithAbort(Math.min(30_000, Math.max(1_000, this.config.captureTimeoutMs)), signal))) {
+						return;
+					}
 					continue;
 				}
 				if (result.status === "aborted") return;
@@ -1090,6 +1095,11 @@ export class OpenVikingSessionState {
 		this.#monitorAbortController = new AbortController();
 		this.#commitRecoveryMonitorKeys.clear();
 		this.#monitoredTaskIds.clear();
+	}
+
+	#operationSignal(signal?: AbortSignal): AbortSignal {
+		const lifecycleSignal = this.#monitorAbortController.signal;
+		return signal && signal !== lifecycleSignal ? AbortSignal.any([signal, lifecycleSignal]) : lifecycleSignal;
 	}
 
 	async #captureAndMaybeCommit(
@@ -1307,37 +1317,55 @@ export class OpenVikingSessionState {
 		return result;
 	}
 
-	async formatItems(items: readonly OpenVikingSearchItem[], includeIds = false): Promise<string | undefined> {
+	async formatItems(
+		items: readonly OpenVikingSearchItem[],
+		includeIds = false,
+		signal?: AbortSignal,
+	): Promise<string | undefined> {
 		if (!this.isReady || items.length === 0) return undefined;
+		const operationSignal = this.#operationSignal(signal);
+		operationSignal.throwIfAborted();
 		let budgetRemaining = this.config.recallTokenBudget;
-		const lines = ["<openviking-context>", OPENVIKING_CONTEXT_HEADER];
+		const renderedItems: Array<{ source: string; score?: string; content: string; id?: string }> = [];
 		for (const item of items) {
+			operationSignal.throwIfAborted();
 			if (!this.isReady) return undefined;
 			const score =
-				typeof item.score === "number" ? ` ${(Math.max(0, Math.min(1, item.score)) * 100).toFixed(0)}%` : "";
-			const source = recallSourceLabel(item);
-			const memoryUri = memoryUriFromOpenVikingUri(item.uri);
-			const uriLine = `- [${source}${score}] ${memoryUri}${includeIds ? ` (id: ${memoryUri})` : ""}`;
+				typeof item.score === "number" ? (Math.max(0, Math.min(1, item.score)) * 100).toFixed(0) : undefined;
+			const source = escapeOpenVikingContextValue(recallSourceLabel(item));
+			const memoryUri = escapeOpenVikingContextValue(memoryUriFromOpenVikingUri(item.uri));
+			const id = includeIds ? memoryUri : undefined;
 			if (budgetRemaining <= 0) {
-				lines.push(uriLine);
+				renderedItems.push({
+					source,
+					...(score === undefined ? {} : { score }),
+					content: memoryUri,
+					...(id ? { id } : {}),
+				});
 				continue;
 			}
-			const content = await this.resolveItemContent(item);
-			const contentLine = `- [${source}${score}] ${content}${includeIds ? ` (id: ${memoryUri})` : ""}`;
-			const lineTokens = estimateTokens(contentLine);
-			if (lineTokens > budgetRemaining && lines.length > 2) {
-				lines.push(uriLine);
+			const content = escapeOpenVikingContextValue(await this.resolveItemContent(item, operationSignal));
+			const lineTokens = estimateTokens(`${source} ${score ?? ""} ${content} ${id ?? ""}`);
+			if (lineTokens > budgetRemaining && renderedItems.length > 0) {
+				renderedItems.push({
+					source,
+					...(score === undefined ? {} : { score }),
+					content: memoryUri,
+					...(id ? { id } : {}),
+				});
 				continue;
 			}
-			lines.push(contentLine);
+			renderedItems.push({ source, ...(score === undefined ? {} : { score }), content, ...(id ? { id } : {}) });
 			budgetRemaining -= lineTokens;
 		}
+		operationSignal.throwIfAborted();
 		if (!this.isReady) return undefined;
-		lines.push("</openviking-context>");
-		return lines.join("\n");
+		return prompt.render(openVikingContextTemplate, { items: renderedItems }).trim();
 	}
 
-	async resolveItemContent(item: OpenVikingSearchItem): Promise<string> {
+	async resolveItemContent(item: OpenVikingSearchItem, signal?: AbortSignal): Promise<string> {
+		const operationSignal = this.#operationSignal(signal);
+		operationSignal.throwIfAborted();
 		const memoryUri = memoryUriFromOpenVikingUri(item.uri);
 		const abstract = (item.abstract || item.overview || "").trim();
 		const serverSummary = typeof item.summary === "string" ? item.summary.trim() : "";
@@ -1360,7 +1388,7 @@ export class OpenVikingSessionState {
 				} else if (recalledContent) {
 					content = recalledContent;
 				} else if (item.level === 2 || item.uri.endsWith(".md")) {
-					content = (await this.client.readContent(item.uri))?.trim() || summary || memoryUri;
+					content = (await this.client.readContent(item.uri, operationSignal))?.trim() || summary || memoryUri;
 				} else {
 					content = summary || memoryUri;
 				}
@@ -1385,6 +1413,14 @@ function recallSourceLabel(item: OpenVikingSearchItem): string {
 		default:
 			return "memory";
 	}
+}
+
+function escapeOpenVikingContextValue(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/\r\n?|\n/g, "&#10;");
 }
 
 function parseCaptureCursor(value: unknown): OpenVikingCaptureCursor | undefined {

@@ -128,6 +128,32 @@ describe("buildShareSnapshot", () => {
 		expect(JSON.stringify(plain)).toContain("hunter2-XYZZY");
 	});
 
+	test("redacts the persisted subagent prompt contract", () => {
+		const secret = "subagent-context-secret-ABCDE";
+		const entry = {
+			type: "session_init",
+			id: "init",
+			parentId: null,
+			timestamp: "2026-06-12T00:00:00.000Z",
+			systemPrompt: `full prompt ${secret}`,
+			subagentSystemPrompt: `subagent role ${secret}`,
+			task: `task ${secret}`,
+			tools: ["read", "yield"],
+		} as SessionEntry;
+		const sm = {
+			getHeader: () => sessionData([], "init").header,
+			getEntries: () => [entry],
+			getLeafId: () => "init",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+
+		const snapshot = buildShareSnapshot(sm, { obfuscator });
+
+		expect(JSON.stringify(snapshot)).not.toContain(secret);
+		expect(JSON.stringify(snapshot)).toContain("subagent role");
+		expect(JSON.stringify(entry)).toContain(secret);
+	});
+
 	test("redacts header cwd, bookmark labels, and file-mention paths", () => {
 		const secret = "shareleak-ABCDE";
 		const ts = "2026-06-12T00:00:00.000Z";

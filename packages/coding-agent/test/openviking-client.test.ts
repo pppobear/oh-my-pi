@@ -81,6 +81,65 @@ describe("OpenViking API error mapping", () => {
 			"response did not contain text",
 		);
 	});
+
+	it("rejects non-JSON 2xx responses instead of accepting an empty result", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<html>proxy login</html>", { status: 200 }));
+		const client = new OpenVikingApi(config);
+
+		await expect(client.addMessage("session-1", { role: "user", content: "remember me" })).resolves.toEqual({
+			ok: false,
+			status: 200,
+			error: "Invalid OpenViking response: expected a JSON envelope (HTTP 200)",
+		});
+	});
+
+	it("rejects a successful envelope that omits the result field", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ status: "ok" }));
+		const client = new OpenVikingApi(config);
+
+		await expect(client.ensureSession("session-1")).resolves.toEqual({
+			ok: false,
+			status: 200,
+			error: "Invalid OpenViking response: expected status=ok with a result field (HTTP 200)",
+		});
+	});
+
+	it("binds session and message acknowledgements to the requested session", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(Response.json({ status: "ok", result: { session_id: "other-session" } }))
+			.mockResolvedValueOnce(Response.json({ status: "ok", result: { session_id: "session-1", message_count: 0 } }));
+		const client = new OpenVikingApi(config);
+
+		await expect(client.ensureSession("session-1")).resolves.toEqual({
+			ok: false,
+			status: 200,
+			error: "Invalid OpenViking session response: expected session_id session-1",
+		});
+		await expect(client.addMessage("session-1", { role: "user", content: "remember me" })).resolves.toEqual({
+			ok: false,
+			status: 200,
+			error: "Invalid OpenViking add-message response: message_count must be a positive integer",
+		});
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("accepts valid session and message acknowledgements", async () => {
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(Response.json({ status: "ok", result: { session_id: "session-1" } }))
+			.mockResolvedValueOnce(Response.json({ status: "ok", result: { session_id: "session-1", message_count: 1 } }));
+		const client = new OpenVikingApi(config);
+
+		await expect(client.ensureSession("session-1")).resolves.toMatchObject({
+			ok: true,
+			result: { session_id: "session-1" },
+		});
+		await expect(client.addMessage("session-1", { role: "user", content: "remember me" })).resolves.toEqual({
+			ok: true,
+			status: 200,
+			result: { session_id: "session-1", message_count: 1 },
+		});
+	});
 });
 
 describe("OpenViking peer-aware recall", () => {
@@ -145,9 +204,8 @@ describe("OpenViking peer-aware recall", () => {
 		});
 	});
 
-	it("retries v0.4.8 recall without peer_scope and keeps current-peer memories", async () => {
+	it("fails closed when actor-scoped recall rejects peer_scope", async () => {
 		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
-		let recallRequests = 0;
 		vi.spyOn(globalThis, "fetch").mockImplementation((async (
 			input: Parameters<typeof fetch>[0],
 			init?: Parameters<typeof fetch>[1],
@@ -156,11 +214,46 @@ describe("OpenViking peer-aware recall", () => {
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			requests.push({ url, body });
 			if (url.endsWith("/api/v1/search/recall")) {
+				return Response.json(
+					{ status: "error", error: { code: "INVALID_ARGUMENT", message: "peer_scope unsupported" } },
+					{ status: 422 },
+				);
+			}
+			return Response.json({ status: "ok", result: { skills: [] } });
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
+
+		await expect(client.search("editor preference")).rejects.toThrow("peer_scope unsupported");
+		const recallBodies = requests
+			.filter(request => request.url.endsWith("/api/v1/search/recall"))
+			.map(request => request.body);
+		expect(recallBodies).toHaveLength(1);
+		expect(recallBodies[0]?.peer_scope).toBe("actor");
+		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(false);
+	});
+
+	it("retries v0.4.8 recall after the exact peer_scope extra-field rejection", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown>; actorPeer: string | null }> = [];
+		let recallRequests = 0;
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			const url = String(input);
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push({ url, body, actorPeer: new Headers(init?.headers).get("X-OpenViking-Actor-Peer") });
+			if (url.endsWith("/api/v1/search/recall")) {
 				recallRequests++;
 				if (recallRequests === 1) {
 					return Response.json(
-						{ status: "error", error: { code: "INVALID_ARGUMENT", message: "peer_scope unsupported" } },
-						{ status: 422 },
+						{
+							status: "error",
+							error: {
+								code: "INVALID_ARGUMENT",
+								message: "Invalid request parameters: body.peer_scope: Extra inputs are not permitted",
+							},
+						},
+						{ status: 400 },
 					);
 				}
 				return Response.json({
@@ -191,16 +284,15 @@ describe("OpenViking peer-aware recall", () => {
 				_sourceType: "memory",
 			},
 		]);
-		expect(recallRequests).toBe(2);
-		const recallBodies = requests
-			.filter(request => request.url.endsWith("/api/v1/search/recall"))
-			.map(request => request.body);
-		expect(recallBodies[0]?.peer_scope).toBe("actor");
-		expect(recallBodies[1]).not.toHaveProperty("peer_scope");
+		const recallRequestsSent = requests.filter(request => request.url.endsWith("/api/v1/search/recall"));
+		expect(recallRequestsSent).toHaveLength(2);
+		expect(recallRequestsSent[0]).toMatchObject({ actorPeer: "project-a", body: { peer_scope: "actor" } });
+		expect(recallRequestsSent[1]?.actorPeer).toBe("project-a");
+		expect(recallRequestsSent[1]?.body).not.toHaveProperty("peer_scope");
 		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(false);
 	});
 
-	it("uses legacy find only when the recall endpoint is absent", async () => {
+	it("uses legacy global find when the recall endpoint is absent and workspace peers are disabled", async () => {
 		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
 		vi.spyOn(globalThis, "fetch").mockImplementation((async (
 			input: Parameters<typeof fetch>[0],
@@ -223,7 +315,7 @@ describe("OpenViking peer-aware recall", () => {
 			}
 			return Response.json({ status: "ok", result: { skills: [] } });
 		}) as unknown as typeof fetch);
-		const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
+		const client = new OpenVikingApi(config);
 
 		await expect(client.search("global preference")).resolves.toMatchObject([
 			{ uri: "viking://user/memories/preferences/global.md", _sourceType: "memory" },
@@ -232,28 +324,40 @@ describe("OpenViking peer-aware recall", () => {
 		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(true);
 	});
 
-	it("surfaces a validation failure after the peer_scope downgrade", async () => {
-		let recallRequests = 0;
+	it("fails closed when actor-scoped recall endpoint is absent", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
 		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
 			if (!String(input).endsWith("/api/v1/search/recall")) {
 				return Response.json({ status: "ok", result: { skills: [] } });
 			}
-			recallRequests++;
-			return Response.json(
-				{
-					status: "error",
-					error: {
-						code: "INVALID_ARGUMENT",
-						message: recallRequests === 1 ? "peer_scope unsupported" : "invalid recall quotas",
-					},
-				},
-				{ status: recallRequests === 1 ? 422 : 400 },
-			);
+			requests.push({ url: String(input), body: {} });
+			return Response.json({ status: "error", error: { code: "NOT_FOUND", message: "not found" } }, { status: 404 });
 		}) as unknown as typeof fetch);
 		const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
 
-		await expect(client.search("editor preference")).rejects.toThrow("invalid recall quotas");
-		expect(recallRequests).toBe(2);
+		await expect(client.search("editor preference")).rejects.toThrow("refusing an unscoped legacy search fallback");
+		expect(requests).toHaveLength(1);
+	});
+
+	it("does not remove peer_scope after either validation status", async () => {
+		for (const status of [400, 422]) {
+			let recallRequests = 0;
+			vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+				if (!String(input).endsWith("/api/v1/search/recall")) {
+					return Response.json({ status: "ok", result: { skills: [] } });
+				}
+				recallRequests++;
+				return Response.json(
+					{ status: "error", error: { code: "INVALID_ARGUMENT", message: `validation ${status}` } },
+					{ status },
+				);
+			}) as unknown as typeof fetch);
+			const client = new OpenVikingApi({ ...config, peerId: "project-a", peerSource: "workspace" });
+
+			await expect(client.search("editor preference")).rejects.toThrow(`validation ${status}`);
+			expect(recallRequests).toBe(1);
+			vi.restoreAllMocks();
+		}
 	});
 
 	it("rejects malformed recall text fields before rendering them", async () => {
@@ -484,6 +588,85 @@ describe("OpenViking peer-aware recall", () => {
 			"viking://user/memories/entities/service-a.md",
 			"viking://user/memories/entities/service-b.md",
 		]);
+	});
+
+	it("keeps successful memory recall when optional skill search fails", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+			if (String(input).endsWith("/api/v1/search/recall")) {
+				return Response.json({
+					status: "ok",
+					result: {
+						entries: [
+							{
+								uri: "viking://user/memories/entities/service.md",
+								score: 0.9,
+								type: "entities",
+								content: "The service is healthy.",
+							},
+						],
+					},
+				});
+			}
+			return Response.json(
+				{ status: "error", error: { code: "UNAVAILABLE", message: "skills unavailable" } },
+				{ status: 503 },
+			);
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi(config);
+
+		await expect(client.search("service health")).resolves.toEqual([
+			expect.objectContaining({
+				uri: "viking://user/memories/entities/service.md",
+				content: "The service is healthy.",
+				_sourceType: "memory",
+			}),
+		]);
+	});
+});
+
+describe("OpenViking request cancellation", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("aborts both recall fetches when search is cancelled", async () => {
+		const signals: AbortSignal[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			if (init?.signal) signals.push(init.signal);
+			return await fetchUntilAborted(input, init);
+		}) as unknown as typeof fetch);
+		const controller = new AbortController();
+		const client = new OpenVikingApi(config);
+
+		const search = client.search("service health", 4, controller.signal);
+		controller.abort(new Error("cancelled"));
+
+		await expect(search).rejects.toThrow("cancelled");
+		expect(signals).toHaveLength(2);
+		expect(signals.every(signal => signal.aborted)).toBe(true);
+	});
+
+	it("aborts content reads instead of waiting for the request timeout", async () => {
+		const signals: AbortSignal[] = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			if (init?.signal) signals.push(init.signal);
+			return await fetchUntilAborted(input, init);
+		}) as unknown as typeof fetch);
+		const controller = new AbortController();
+		const client = new OpenVikingApi(config);
+
+		const read = client.readContent("viking://user/memories/entities/service.md", controller.signal);
+		controller.abort(new Error("cancelled read"));
+
+		await expect(read).rejects.toThrow("cancelled read");
+		expect(signals).toHaveLength(1);
+		expect(signals[0]?.aborted).toBe(true);
 	});
 });
 

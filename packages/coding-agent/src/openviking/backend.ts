@@ -1,18 +1,21 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import type { MemoryBackend, MemoryBackendSaveInput, MemoryBackendStartOptions } from "../memory-backend/types";
-import { OpenVikingApi } from "./client";
+import type {
+	MemoryBackend,
+	MemoryBackendSaveInput,
+	MemoryBackendSearchItem,
+	MemoryBackendStartOptions,
+} from "../memory-backend/types";
+import openVikingDeveloperInstructions from "../prompts/system/openviking-developer-instructions.md" with {
+	type: "text",
+};
+import { OpenVikingApi, type OpenVikingSearchItem } from "./client";
 import { loadOpenVikingConfig } from "./config";
 import { getOpenVikingSessionState, OpenVikingSessionState, setOpenVikingSessionState } from "./state";
 import { memoryUriFromOpenVikingUri } from "./uri";
 
-export const OPENVIKING_DEVELOPER_INSTRUCTIONS = [
-	"OpenViking memory is active.",
-	"Use recall to search durable OpenViking memories before relying on guesses about user preferences or prior work.",
-	"Use retain to store durable facts, decisions, preferences, and reusable project knowledge.",
-	"Do not retain OpenViking recall blocks or transient tool output unless the user explicitly asked to remember it.",
-].join("\n");
+export const OPENVIKING_DEVELOPER_INSTRUCTIONS = openVikingDeveloperInstructions.trim();
 
 export const openVikingBackend: MemoryBackend = {
 	id: "openviking",
@@ -20,27 +23,30 @@ export const openVikingBackend: MemoryBackend = {
 	async start(options: MemoryBackendStartOptions): Promise<void> {
 		const { session, settings } = options;
 		const transcriptId = session.sessionManager.getSessionId();
-		if (!transcriptId) return;
+		if (!transcriptId || session.isDisposed) return;
 
 		if (options.taskDepth > 0) {
 			const parent = options.parentOpenVikingSessionState?.aliasOf ?? options.parentOpenVikingSessionState;
-			if (!parent) return;
-			const previous = setOpenVikingSessionState(
+			if (!parent || session.isDisposed) return;
+			const state = new OpenVikingSessionState({
+				sessionId: transcriptId,
+				config: parent.config,
+				client: parent.client,
 				session,
-				new OpenVikingSessionState({
-					sessionId: transcriptId,
-					config: parent.config,
-					client: parent.client,
-					session,
-					aliasOf: parent,
-				}),
-			);
+				aliasOf: parent,
+			});
+			const previous = setOpenVikingSessionState(session, state);
 			await previous?.dispose({ flush: false });
+			if (session.isDisposed && getOpenVikingSessionState(session) === state) {
+				setOpenVikingSessionState(session, undefined);
+				await state.dispose({ flush: false });
+			}
 			return;
 		}
 
 		try {
 			const config = await loadOpenVikingConfig(settings);
+			if (session.isDisposed) return;
 			const client = new OpenVikingApi(config);
 			const startingBranchIds = session.sessionManager.getBranch().map(entry => entry.id);
 			const transcriptStillCurrent = (): boolean => {
@@ -51,6 +57,10 @@ export const openVikingBackend: MemoryBackend = {
 			const candidate = new OpenVikingSessionState({ sessionId: transcriptId, config, client, session });
 			const ensured = await client.ensureSession(candidate.sessionId);
 			if (!ensured.ok) throw new Error(ensured.error ?? `HTTP ${ensured.status ?? "unknown"}`);
+			if (session.isDisposed) {
+				await candidate.dispose({ flush: false });
+				return;
+			}
 			// A session transition may have won while the remote ensure was in
 			// flight. Never install state whose remote id belongs to the old
 			// transcript; the transition/reconcile caller will retry for the live id.
@@ -211,7 +221,24 @@ export const openVikingBackend: MemoryBackend = {
 			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
 		}
 		const limit = Math.max(1, Math.floor(options?.limit ?? primary.config.recallLimit));
-		const results = await primary.search(query, limit);
+		let results: OpenVikingSearchItem[];
+		try {
+			results = await primary.search(query, limit, options?.signal);
+		} catch (error) {
+			if (options?.signal?.aborted) {
+				return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
+			}
+			if (!primary.isReady) {
+				return {
+					backend: "openviking" as const,
+					query,
+					count: 0,
+					items: [],
+					message: "OpenViking workspace changed while search was running.",
+				};
+			}
+			throw error;
+		}
 		if (options?.signal?.aborted) {
 			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
 		}
@@ -224,25 +251,42 @@ export const openVikingBackend: MemoryBackend = {
 				message: "OpenViking workspace changed while search was running.",
 			};
 		}
-		const items = await Promise.all(
-			results.map(async item => {
-				const uri = memoryUriFromOpenVikingUri(item.uri);
+		let items: MemoryBackendSearchItem[];
+		try {
+			items = await Promise.all(
+				results.map(async item => {
+					const uri = memoryUriFromOpenVikingUri(item.uri);
+					return {
+						id: uri,
+						content: (await primary.resolveItemContent(item, options?.signal)).trim(),
+						score: item.score,
+						source: item._sourceType,
+						metadata: {
+							uri,
+							category: item.category,
+							level: item.level,
+							origin: item.origin,
+							rank: item.rank,
+							mode: item.mode,
+						},
+					};
+				}),
+			);
+		} catch (error) {
+			if (options?.signal?.aborted) {
+				return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
+			}
+			if (!primary.isReady) {
 				return {
-					id: uri,
-					content: (await primary.resolveItemContent(item)).trim(),
-					score: item.score,
-					source: item._sourceType,
-					metadata: {
-						uri,
-						category: item.category,
-						level: item.level,
-						origin: item.origin,
-						rank: item.rank,
-						mode: item.mode,
-					},
+					backend: "openviking" as const,
+					query,
+					count: 0,
+					items: [],
+					message: "OpenViking workspace changed while search was running.",
 				};
-			}),
-		);
+			}
+			throw error;
+		}
 		if (options?.signal?.aborted) {
 			return { backend: "openviking" as const, query, count: 0, items: [], message: "Search aborted." };
 		}

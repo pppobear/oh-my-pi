@@ -61,7 +61,7 @@ When no matches exist:
 
 ## Modes / Variants
 - Tool path: explicit query-only recall. It does not compose context from recent turns.
-- Backend auto-recall has a richer query-composition path in `HindsightSessionState.beforeAgentStartPrompt(...)` / `maybeRecallOnAgentStart(...)` and `MnemopiSessionState.beforeAgentStartPrompt(...)` / `maybeRecallOnAgentStart(...)`.
+- Backend auto-recall has a richer query-composition path in `HindsightSessionState.beforeAgentStartPrompt(...)` / `maybeRecallOnAgentStart(...)`, `MnemopiSessionState.beforeAgentStartPrompt(...)` / `maybeRecallOnAgentStart(...)`, and `OpenVikingSessionState.beforeAgentStartPrompt(...)`. OpenViking refreshes its injected context before every agent turn while auto-recall is enabled.
 - Hindsight bank scoping:
   - `global` — no tag filter.
   - `per-project` — separate bank id per project label (git primary checkout root basename; cwd basename outside a repo).
@@ -76,10 +76,11 @@ When no matches exist:
 - Network
   - Hindsight: `POST /v1/default/banks/{bank_id}/memories/recall`.
   - Mnemopi: none unless configured local runtime providers perform embedding/LLM work during recall.
+  - OpenViking: `POST /api/v1/search/recall` plus skill enrichment through `POST /api/v1/search/find`. OpenViking 0.4.8 rejects the newer `peer_scope` field but already scopes recall to the actor header, so that exact extra-field rejection is retried without the field. Other actor-scope failures remain fail-closed. When no actor peer isolation is required, servers without the recall endpoint may use `/api/v1/search/find` for global memories. Selected results without embedded content may also require `GET /api/v1/content/read`.
 - Session state
   - None on success for the explicit tool path. Unlike backend auto-recall, this tool does not update `lastRecallSnippet` or refresh the system prompt.
 - Background work / cancellation
-  - Aborts through `untilAborted(...)` if the tool call signal is cancelled.
+  - Aborts through `untilAborted(...)` if the tool call signal is cancelled. OpenViking also forwards that signal into remote search and content-read requests.
 
 ## Limits & Caps
 - Tool availability requires `memory.backend` to be `"hindsight"`, `"mnemopi"`, or `"openviking"`; default `memory.backend` is `"off"`.

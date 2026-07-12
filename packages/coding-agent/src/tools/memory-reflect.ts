@@ -71,14 +71,14 @@ export class MemoryReflectTool implements AgentTool<typeof memoryReflectSchema> 
 					const query = params.context?.trim()
 						? `${params.query.trim()}\n\nAdditional context:\n${params.context.trim()}`
 						: params.query;
-					const results = await primary.search(query, primary.config.recallLimit);
+					const results = await primary.search(query, primary.config.recallLimit, signal);
 					if (results.length === 0) {
 						return {
 							content: [{ type: "text", text: "No relevant information found to reflect on." }],
 							details: {},
 						};
 					}
-					const summary = await primary.formatItems(results, true);
+					const summary = await primary.formatItems(results, true, signal);
 					return {
 						content: [{ type: "text", text: `Based on recalled OpenViking memories:\n\n${summary ?? ""}` }],
 						details: {},
