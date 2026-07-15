@@ -165,7 +165,9 @@ export class OpenVikingApi {
 		if (recalledMemories) {
 			return mergeServerRankedRecall(recalledMemories, skills, query).slice(0, limit);
 		}
-		const legacyMemories = await this.#searchOneSource(query, MEMORY_SEARCH_SOURCE, Math.max(limit * 2, 8), signal);
+		const legacyMemories = await this.#searchOneSource(query, MEMORY_SEARCH_SOURCE, Math.max(limit * 2, 8), signal, {
+			includeActorPeer: this.#config.recallPeerScope === "actor",
+		});
 		signal?.throwIfAborted();
 		return dedupeAndRank([...legacyMemories, ...skills], query).slice(0, limit);
 	}
@@ -362,6 +364,7 @@ export class OpenVikingApi {
 		source: OpenVikingSearchSource,
 		limit: number,
 		signal?: AbortSignal,
+		requestOptions: { includeActorPeer?: boolean } = {},
 	): Promise<OpenVikingSearchItem[]> {
 		const body = {
 			query,
@@ -369,11 +372,15 @@ export class OpenVikingApi {
 			limit,
 			score_threshold: 0,
 		};
-		const response = await this.#request<Record<string, unknown>>("/api/v1/search/find", {
-			method: "POST",
-			body: JSON.stringify(body),
-			signal,
-		});
+		const response = await this.#request<Record<string, unknown>>(
+			"/api/v1/search/find",
+			{
+				method: "POST",
+				body: JSON.stringify(body),
+				signal,
+			},
+			requestOptions,
+		);
 		signal?.throwIfAborted();
 		if (!response.ok) throw openVikingRequestError(`search ${source.type}`, response);
 		if (!response.result || typeof response.result !== "object") {

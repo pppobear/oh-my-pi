@@ -322,15 +322,15 @@ describe("OpenViking peer-aware recall", () => {
 		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(false);
 	});
 
-	it("uses legacy global find when the recall endpoint is absent and workspace peers are disabled", async () => {
-		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+	it("omits the actor header from legacy global find for all-peer recall", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown>; actorPeer: string | null }> = [];
 		vi.spyOn(globalThis, "fetch").mockImplementation((async (
 			input: Parameters<typeof fetch>[0],
 			init?: Parameters<typeof fetch>[1],
 		) => {
 			const url = String(input);
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-			requests.push({ url, body });
+			requests.push({ url, body, actorPeer: new Headers(init?.headers).get("X-OpenViking-Actor-Peer") });
 			if (url.endsWith("/api/v1/search/recall")) {
 				return Response.json(
 					{ status: "error", error: { code: "NOT_FOUND", message: "not found" } },
@@ -345,13 +345,23 @@ describe("OpenViking peer-aware recall", () => {
 			}
 			return Response.json({ status: "ok", result: { skills: [] } });
 		}) as unknown as typeof fetch);
-		const client = new OpenVikingApi(config);
+		const client = new OpenVikingApi({
+			...config,
+			peerId: "project-a",
+			peerSource: "workspace",
+			workspacePeer: true,
+			recallPeerScope: "all",
+		});
 
 		await expect(client.search("global preference")).resolves.toMatchObject([
 			{ uri: "viking://user/memories/preferences/global.md", _sourceType: "memory" },
 		]);
-		expect(requests.filter(request => request.url.endsWith("/api/v1/search/recall"))).toHaveLength(1);
-		expect(requests.some(request => request.body.target_uri === "viking://user/memories")).toBe(true);
+		const recallRequest = requests.find(request => request.url.endsWith("/api/v1/search/recall"));
+		expect(recallRequest?.actorPeer).toBeNull();
+		const memoryRequest = requests.find(request => request.body.target_uri === "viking://user/memories");
+		expect(memoryRequest?.actorPeer).toBeNull();
+		const skillRequest = requests.find(request => request.body.target_uri === "viking://user/skills");
+		expect(skillRequest?.actorPeer).toBe("project-a");
 	});
 
 	it("fails closed when actor-scoped recall endpoint is absent", async () => {
