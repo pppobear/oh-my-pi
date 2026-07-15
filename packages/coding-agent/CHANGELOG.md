@@ -13,6 +13,9 @@
 
 - Added the `edit.enforceSeenLines` setting (default off) to gate the hashline seen-line guard. When off, hashline tags validate on content hash alone and any anchor into the tagged content applies; when on, edits anchored on lines a prior `read`/`grep` never displayed are rejected.
 - Added per-agent prewalk for subagents: a `prewalk` frontmatter field (`true` = hand off to the default prewalk target, a string = custom target model pattern) and a `task.agentPrewalk` settings override toggled per agent from the `/agents` dashboard with `P`. The bundled generic `task` agent ships with prewalk enabled by default (skipped when the target resolves to the subagent's own starting model, and never armed for plan-mode spawns). Prewalk-armed subagents keep the normally parent-owned `todo` tool so the plan-nudge → todo → hand-off flow works, and the prewalk todo gate now keys on the active tool set instead of the registry so a deactivated todo tool can no longer stall the switch.
+- Added `memory.backend: openviking` with per-turn recalled context, `recall`/`retain`/`reflect`/`learn` support, automatic session capture, `/memory` status/search/save, `memory://` resource reads, and shared parent/subagent memory state.
+- Added collision-resistant OpenViking workspace isolation with explicit peer overrides, opt-in cross-project recall, an unscoped opt-out, and actor-scoped recall across supported server versions.
+- Added resumable two-phase OpenViking capture and extraction with explicit completion outcomes, background automatic capture, live settings reconciliation, and credentials resolved from environment overrides or the matching CLI profile.
 - Added `xd://` virtual tool devices (setting `tools.xdev`, default on): built-ins declaring `loadMode: "discoverable"` (browser, debug, lsp, ast_grep/ast_edit, github, web_search, ...) are unmounted from the request's tools array entirely and driven through the tools the model already has: `read xd://` lists mounted devices, `read xd://<tool>` returns docs + JSON schema, and `write xd://<tool>` with a JSON args object as content executes the tool. Args validate against the mounted tool's real schema (returned on mismatch), and the tools array (and prompt-cache prefix) never changes shape when devices mount or unmount mid-session. `todo`, `ask`, and `grep` stay top-level for their harness integrations; `/tools` lists mounted devices; and `xd://` writes render with the mounted tool's own TUI renderer — streamed call previews draw nothing until the path is provably not an `xd://` device, then forward the incrementally decoded JSON content as live inner args. Explicit `--tools read,...,xdev` lists opt lean sets into the same mounting; `tools.discoveryMode: "all"` takes precedence when active. Full docs + JSON schema for every mounted device are inlined into the system prompt's `xd://` section, so no discovery `read` is required before first use; `read xd://<tool>` remains available for on-demand re-fetch.
 
 ### Changed
@@ -34,6 +37,8 @@
 
 ### Fixed
 
+- Hardened OpenViking protocol validation, peer-scope compatibility, cancellation, write completion tracking, crash recovery, and session transitions so malformed responses or partial failures cannot leak scope or silently lose transcript data.
+- Made memory backend startup, live reconciliation, and teardown disposal-safe, and masked effective secret settings in the interactive UI and config CLI output.
 - Fixed Bash internal URLs remaining unresolved when used as unquoted arguments inside command substitutions ([#5535](https://github.com/can1357/oh-my-pi/issues/5535)).
 - Fixed `--tools` silently dropping hidden tool names (`xdev`, `yield`, ...); hidden built-ins are now addressable per the `hidden` tool contract.
 - Fixed the built-in `fd` printing `fd: Broken pipe (os error 32)` when a downstream pipeline reader exited early (e.g. `fd … | head`); it now exits silently with 141 (128+SIGPIPE), matching real fd.
@@ -219,18 +224,6 @@
 
 - Fixed PageUp/PageDown in the model browser wrapping past the list edges instead of clamping
 - Fixed the hover highlight sticking to the last hovered model row when the pointer moved into the provider sidebar
-
-## [16.4.6] - 2026-07-12
-### Added
-
-- Added `memory.backend: openviking` with per-turn recalled context, `recall`/`retain`/`reflect`/`learn` support, automatic session capture, `/memory` status/search/save, `memory://` resource reads, and shared parent/subagent memory state.
-- Added collision-resistant OpenViking workspace isolation with explicit peer overrides, opt-in cross-project recall, an unscoped opt-out, and actor-scoped recall across supported server versions.
-- Added resumable two-phase OpenViking capture and extraction with explicit completion outcomes, background automatic capture, live settings reconciliation, and credentials resolved from environment overrides or the matching CLI profile.
-
-### Fixed
-
-- Hardened OpenViking protocol validation, actor-scope compatibility, cancellation, write completion tracking, crash recovery, and session transitions so malformed responses or partial failures cannot leak scope or silently lose transcript data.
-- Made memory backend startup, live reconciliation, and teardown disposal-safe, and masked effective secret settings in the interactive UI and config CLI output.
 
 ## [16.4.6] - 2026-07-12
 

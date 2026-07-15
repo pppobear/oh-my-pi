@@ -220,7 +220,7 @@ describe("OpenViking memory backend", () => {
 			} as never,
 			["recall", "retain", "reflect"],
 		);
-		expect(tools.map(tool => tool.name).sort()).toEqual(["recall", "reflect", "resolve", "retain"]);
+		expect(tools.map(tool => tool.name).sort()).toEqual(["recall", "reflect", "retain"]);
 	});
 
 	it("reports runtime status through the OpenViking health endpoint", async () => {

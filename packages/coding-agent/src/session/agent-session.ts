@@ -6859,17 +6859,13 @@ export class AgentSession {
 	}
 
 	/** Replace only session-owned, backend-dependent built-ins. */
-	async refreshMemoryTools(
-		memoryTools: AgentTool[],
-		options: { forceActive?: Iterable<string>; rebuildSystemPrompt?: boolean } = {},
-	): Promise<void> {
+	async refreshMemoryTools(memoryTools: AgentTool[], options: { rebuildSystemPrompt?: boolean } = {}): Promise<void> {
 		const previousInstalled = new Set(this.#installedMemoryBuiltinToolNames);
-		const nextActive = this.getActiveToolNames().filter(name => !previousInstalled.has(name));
+		const nextActive = this.getEnabledToolNames().filter(name => !previousInstalled.has(name));
 
 		for (const name of previousInstalled) {
 			if (this.#builtInToolNames.has(name)) this.#toolRegistry.delete(name);
 			this.#builtInToolNames.delete(name);
-			this.#selectedDiscoveredToolNames.delete(name);
 		}
 		this.#installedMemoryBuiltinToolNames.clear();
 
@@ -6884,12 +6880,8 @@ export class AgentSession {
 			installed.push(wrapped);
 		}
 
-		const forceActive = new Set(options.forceActive ?? []);
-		const discoveryMode = this.#resolveEffectiveDiscoveryMode();
 		for (const tool of installed) {
-			if (forceActive.has(tool.name) || discoveryMode !== "all" || tool.loadMode !== "discoverable") {
-				nextActive.push(tool.name);
-			}
+			nextActive.push(tool.name);
 		}
 		await this.#applyActiveToolsByName([...new Set(nextActive)], {
 			rebuildSystemPrompt: options.rebuildSystemPrompt,
@@ -7058,10 +7050,7 @@ export class AgentSession {
 		);
 	}
 
-	async #applyActiveToolsByName(
-		toolNames: string[],
-		options?: { rebuildSystemPrompt?: boolean },
-	): Promise<void> {
+	async #applyActiveToolsByName(toolNames: string[], options?: { rebuildSystemPrompt?: boolean }): Promise<void> {
 		toolNames = normalizeToolNames(toolNames);
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];

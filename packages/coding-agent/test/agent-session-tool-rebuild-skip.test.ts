@@ -146,7 +146,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		const staleRefresh = session.refreshBaseSystemPrompt();
 		await staleRefreshStarted.promise;
 		const replacement = createMcpCustomTool("mcp__demo_tool", "demo", "tool", "Demo tool");
-		await session.refreshMCPTools([replacement], { activateAll: true });
+		await session.refreshMCPTools([replacement]);
 		releaseStaleRefresh.resolve();
 		await staleRefresh;
 

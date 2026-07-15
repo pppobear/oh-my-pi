@@ -3056,8 +3056,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const memoryTools = openVikingUnavailable ? [] : await createMemoryRuntimeTools();
 			try {
 				await session.refreshMemoryTools(memoryTools, {
-					forceActive:
-						memoryBackend.id === "openviking" && !openVikingUnavailable ? ["recall", "retain", "reflect"] : [],
 					rebuildSystemPrompt: false,
 				});
 				// A connection-only change can leave tool signatures byte-identical while
