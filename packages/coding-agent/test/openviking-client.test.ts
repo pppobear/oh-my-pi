@@ -203,6 +203,37 @@ describe("OpenViking peer-aware recall", () => {
 		});
 	});
 
+	it("omits the actor header only from all-peer recall requests", async () => {
+		const requests: Array<{ url: string; body: Record<string, unknown>; actorPeer: string | null }> = [];
+		vi.spyOn(globalThis, "fetch").mockImplementation((async (
+			input: Parameters<typeof fetch>[0],
+			init?: Parameters<typeof fetch>[1],
+		) => {
+			const url = String(input);
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			requests.push({ url, body, actorPeer: new Headers(init?.headers).get("X-OpenViking-Actor-Peer") });
+			if (url.endsWith("/api/v1/search/recall")) {
+				return Response.json({ status: "ok", result: { entries: [], rendered: "", stats: {} } });
+			}
+			return Response.json({ status: "ok", result: { skills: [] } });
+		}) as unknown as typeof fetch);
+		const client = new OpenVikingApi({
+			...config,
+			peerId: "project-a",
+			peerSource: "workspace",
+			workspacePeer: true,
+			recallPeerScope: "all",
+		});
+
+		await expect(client.search("cross-project preference")).resolves.toEqual([]);
+
+		const recallRequest = requests.find(request => request.url.endsWith("/api/v1/search/recall"));
+		expect(recallRequest?.actorPeer).toBeNull();
+		expect(recallRequest?.body).not.toHaveProperty("peer_scope");
+		const skillRequest = requests.find(request => request.body.target_uri === "viking://user/skills");
+		expect(skillRequest?.actorPeer).toBe("project-a");
+	});
+
 	it("fails closed when actor-scoped recall rejects peer_scope", async () => {
 		const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
 		vi.spyOn(globalThis, "fetch").mockImplementation((async (

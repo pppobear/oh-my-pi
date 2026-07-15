@@ -398,20 +398,29 @@ export class OpenVikingApi {
 		if (this.#config.recallPeerScope === "actor") body.peer_scope = "actor";
 
 		const requiresActorPeerIsolation = this.#config.recallPeerScope === "actor" && this.#config.peerId !== null;
-		let response = await this.#request<unknown>("/api/v1/search/recall", {
-			method: "POST",
-			body: JSON.stringify(body),
-			signal,
-		});
+		const recallRequestOptions = { includeActorPeer: this.#config.recallPeerScope === "actor" };
+		let response = await this.#request<unknown>(
+			"/api/v1/search/recall",
+			{
+				method: "POST",
+				body: JSON.stringify(body),
+				signal,
+			},
+			recallRequestOptions,
+		);
 		signal?.throwIfAborted();
 		if (!response.ok && body.peer_scope && isLegacyRecallPeerScopeRejection(response)) {
 			const legacyBody = { ...body };
 			delete legacyBody.peer_scope;
-			response = await this.#request<unknown>("/api/v1/search/recall", {
-				method: "POST",
-				body: JSON.stringify(legacyBody),
-				signal,
-			});
+			response = await this.#request<unknown>(
+				"/api/v1/search/recall",
+				{
+					method: "POST",
+					body: JSON.stringify(legacyBody),
+					signal,
+				},
+				recallRequestOptions,
+			);
 			signal?.throwIfAborted();
 		}
 		if (!response.ok) {
@@ -447,7 +456,7 @@ export class OpenVikingApi {
 	async #request<T>(
 		path: string,
 		init: RequestInit = {},
-		options: { parseJson?: boolean; timeoutMs?: number } = {},
+		options: { includeActorPeer?: boolean; parseJson?: boolean; timeoutMs?: number } = {},
 	): Promise<OpenVikingFetchResult<T>> {
 		const controller = new AbortController();
 		const externalSignal = init.signal ?? undefined;
@@ -461,7 +470,9 @@ export class OpenVikingApi {
 			if (this.#config.apiKey) headers.set("Authorization", `Bearer ${this.#config.apiKey}`);
 			if (this.#config.accountId) headers.set("X-OpenViking-Account", this.#config.accountId);
 			if (this.#config.userId) headers.set("X-OpenViking-User", this.#config.userId);
-			if (this.#config.peerId) headers.set("X-OpenViking-Actor-Peer", this.#config.peerId);
+			if (this.#config.peerId && options.includeActorPeer !== false) {
+				headers.set("X-OpenViking-Actor-Peer", this.#config.peerId);
+			}
 			const response = await fetch(`${this.#config.baseUrl}${path}`, {
 				...init,
 				headers,

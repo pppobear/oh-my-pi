@@ -76,7 +76,7 @@ When no matches exist:
 - Network
   - Hindsight: `POST /v1/default/banks/{bank_id}/memories/recall`.
   - Mnemopi: none unless configured local runtime providers perform embedding/LLM work during recall.
-  - OpenViking: `POST /api/v1/search/recall` plus skill enrichment through `POST /api/v1/search/find`. OpenViking 0.4.8 rejects the newer `peer_scope` field but already scopes recall to the actor header, so that exact extra-field rejection is retried without the field. Other actor-scope failures remain fail-closed. When no actor peer isolation is required, servers without the recall endpoint may use `/api/v1/search/find` for global memories. Selected results without embedded content may also require `GET /api/v1/content/read`.
+  - OpenViking: `POST /api/v1/search/recall` plus skill enrichment through `POST /api/v1/search/find`. OpenViking 0.4.8 rejects the newer `peer_scope` field but already scopes actor recall to the actor header, so that exact extra-field rejection is retried without the field. All-peer recall omits the actor header so a configured workspace peer cannot silently narrow cross-project results. Other actor-scope failures remain fail-closed. When no actor peer isolation is required, servers without the recall endpoint may use `/api/v1/search/find` for global memories. Selected results without embedded content may also require `GET /api/v1/content/read`.
 - Session state
   - None on success for the explicit tool path. Unlike backend auto-recall, this tool does not update `lastRecallSnippet` or refresh the system prompt.
 - Background work / cancellation
