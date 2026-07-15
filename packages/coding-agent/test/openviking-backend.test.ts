@@ -989,6 +989,41 @@ describe("OpenViking memory backend", () => {
 		expect(client.commitSession).toHaveBeenCalledTimes(1);
 	});
 
+	it("clears the pending cursor after a definitively rejected explicit write", async () => {
+		const settings = Settings.isolated({ "memory.backend": "openviking" });
+		const session = makeFakeSession(settings);
+		const addMessage = vi
+			.fn(async (): Promise<OpenVikingFetchResult<unknown>> => ({ ok: true }))
+			.mockResolvedValueOnce({ ok: false, status: 401, error: "unauthorized" });
+		const client = {
+			addMessage,
+			commitSession: vi.fn(async () => commitAccepted()),
+			waitForCommitTask: vi.fn(async () => extractionCompleted()),
+		} as unknown as OpenVikingApi;
+		const state = new OpenVikingSessionState({
+			sessionId: "session-1",
+			config: baseConfig,
+			client,
+			session: session as never,
+		});
+
+		await expect(state.save("rejected write")).resolves.toEqual({
+			status: "failed",
+			error: "OpenViking did not accept the memory write (unauthorized).",
+		});
+		const rejectedCursor = session.customEntries.at(-1)?.data as
+			| { hasUnarchivedRemoteMessages?: boolean }
+			| undefined;
+		expect(rejectedCursor?.hasUnarchivedRemoteMessages).toBe(false);
+
+		await expect(state.save("retry after credentials are fixed")).resolves.toMatchObject({
+			status: "stored",
+			extracted: 1,
+		});
+		expect(addMessage).toHaveBeenCalledTimes(2);
+		expect(client.commitSession).toHaveBeenCalledTimes(1);
+	});
+
 	it("recovers an ambiguously acknowledged explicit write by archiving the remote tail", async () => {
 		const settings = Settings.isolated({ "memory.backend": "openviking" });
 		const session = makeFakeSession(settings);

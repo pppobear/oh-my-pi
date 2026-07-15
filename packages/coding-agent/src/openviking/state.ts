@@ -20,6 +20,10 @@ const OPENVIKING_SESSION_PREFIX = "omp-";
 const OPENVIKING_CAPTURE_CURSOR_TYPE = "openviking-capture-cursor";
 const OPENVIKING_CAPTURE_CURSOR_VERSION = 4;
 
+function isAmbiguousWriteAcceptance(status: number | undefined): boolean {
+	return status === undefined || status >= 500 || (status >= 200 && status < 300);
+}
+
 type CapturedRole = "user" | "assistant";
 
 interface OpenVikingCursorIdentity {
@@ -394,6 +398,16 @@ export class OpenVikingSessionState {
 			);
 			if (!response.ok) {
 				const addError = response.error ?? `HTTP ${response.status ?? "unknown"}`;
+				if (!isAmbiguousWriteAcceptance(response.status)) {
+					this.#pendingCommit = previouslyPendingCommit;
+					const cursorRestored = this.#persistCaptureCursor(sessionId);
+					return {
+						status: "failed",
+						error: cursorRestored
+							? `OpenViking did not accept the memory write (${addError}).`
+							: `OpenViking did not accept the memory write (${addError}), and its retry cursor could not be restored.`,
+					};
+				}
 				const recovery = await this.#archivePendingMessages(
 					sessionId,
 					this.lastCapturedMessageCount,
@@ -586,11 +600,7 @@ export class OpenVikingSessionState {
 		if (!response.ok || !response.result) {
 			const error = response.error ?? `OpenViking commit failed (HTTP ${response.status ?? "unknown"}).`;
 			logger.warn("OpenViking: commit failed", { sessionId, error });
-			if (
-				response.status === undefined ||
-				response.status >= 500 ||
-				(response.status >= 200 && response.status < 300)
-			) {
+			if (isAmbiguousWriteAcceptance(response.status)) {
 				const recovery = await this.#recoverCommitTask(sessionId);
 				if (recovery.status === "accepted") return recovery;
 				if (recovery.status === "orphaned") return recovery;
