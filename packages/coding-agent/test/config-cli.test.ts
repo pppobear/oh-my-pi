@@ -229,12 +229,22 @@ describe("config CLI schema coverage", () => {
 		using _environment = isolateSecretEnvironment();
 		await initTheme();
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation((_chunk, callback) => {
+			if (typeof callback === "function") callback();
+			return true;
+		});
 		const secret = "openviking-cli-secret-value";
 		const outputs: string[] = [];
 		const capture = async (command: Parameters<typeof runConfigCommand>[0]): Promise<string> => {
 			logSpy.mockClear();
+			stdoutSpy.mockClear();
 			await runConfigCommand(command);
-			const output = logSpy.mock.calls.map(call => String(call[0] ?? "")).join("\n");
+			const output = [
+				logSpy.mock.calls.map(call => String(call[0] ?? "")).join("\n"),
+				stdoutSpy.mock.calls.map(call => String(call[0] ?? "")).join(""),
+			]
+				.filter(Boolean)
+				.join("\n");
 			outputs.push(output);
 			return output;
 		};
