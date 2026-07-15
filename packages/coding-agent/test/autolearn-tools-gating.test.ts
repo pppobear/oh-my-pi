@@ -290,6 +290,33 @@ describe("learn execute", () => {
 		expect(queued).toEqual(["queued lesson"]);
 	});
 
+	it("surfaces OpenViking reconciliation and skips the managed skill", async () => {
+		const message =
+			"OpenViking archived the previously pending session tail; this new memory input was not sent. Retry it after reconciliation completes.";
+		const session = makeSession(
+			{ "autolearn.enabled": true, "memory.backend": "openviking" },
+			{
+				getOpenVikingSessionState: () =>
+					({
+						save: async () => ({ status: "reconciling" as const, message }),
+					}) as unknown as OpenVikingSessionState,
+			},
+		);
+
+		await expect(
+			new LearnTool(session).execute("openviking-reconciling", {
+				memory: "retry this lesson",
+				skill: {
+					action: "create",
+					name: "should-not-exist",
+					description: "A skill that must not be created.",
+					body: "# Should not exist",
+				},
+			}),
+		).rejects.toThrow(message);
+		expect(await Bun.file(path.join(getManagedSkillsDir(), "should-not-exist", "SKILL.md")).exists()).toBe(false);
+	});
+
 	it("reports an unfinished OpenViking extraction as queued", async () => {
 		const session = makeSession(
 			{ "autolearn.enabled": true, "memory.backend": "openviking" },

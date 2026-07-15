@@ -98,7 +98,7 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 				throw new Error(outcome.error);
 			}
 			if (outcome.status === "reconciling") {
-				memoryMessage = "Lesson write acknowledgement unavailable; automatic reconciliation pending";
+				throw new Error(outcome.message);
 			}
 			if (outcome.status === "queued") {
 				memoryMessage =
