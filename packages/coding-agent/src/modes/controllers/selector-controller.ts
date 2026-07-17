@@ -1134,11 +1134,21 @@ export class SelectorController {
 				realLeafId,
 				this.ctx.ui.terminal.rows,
 				async entryId => {
-					// Selecting the current leaf is a no-op (already there)
+					// Selecting the current leaf is normally a no-op (already there) —
+					// unless it's an `ask` toolResult, in which case the re-answer flow
+					// must still be allowed to reopen the picker even though the leaf
+					// doesn't move (chatgpt-codex review on #5895).
 					if (entryId === realLeafId) {
-						done();
-						this.ctx.showStatus("Already at this point");
-						return;
+						const currentEntry = this.ctx.sessionManager.getEntry(entryId);
+						const currentIsAskResult =
+							currentEntry?.type === "message" &&
+							currentEntry.message.role === "toolResult" &&
+							currentEntry.message.toolName === "ask";
+						if (!currentIsAskResult) {
+							done();
+							this.ctx.showStatus("Already at this point");
+							return;
+						}
 					}
 
 					// Ask about summarization
