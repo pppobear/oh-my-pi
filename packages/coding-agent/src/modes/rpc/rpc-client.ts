@@ -268,7 +268,26 @@ export class RpcClient {
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
 		let readySettled = false;
 
-		// Process lines in background, intercepting the ready signal
+		const reapAfterOutputFailure = async (error: Error) => {
+			if (this.#process !== child) return;
+
+			this.#process = null;
+			this.#abortController.abort(error);
+			const pendingRequests = Array.from(this.#pendingRequests.values());
+			this.#pendingRequests.clear();
+			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
+			this.#pendingHostToolCalls.clear();
+
+			try {
+				child.kill();
+			} catch {
+				// The process may already have exited.
+			}
+			await child.exited.catch(() => {});
+			for (const request of pendingRequests) request.reject(error);
+		};
+
+		// Process lines in background, intercepting the ready signal.
 		const lines = readJsonl(child.stdout, this.#abortController.signal);
 		void (async () => {
 			for await (const line of lines) {
@@ -284,17 +303,23 @@ export class RpcClient {
 			// `exited` only after stderr is fully drained (nonzero exits), so
 			// rejecting here would snapshot a partial stderr tail and lose
 			// the actual startup error.
-			if (readySettled) return;
+			if (readySettled) {
+				await reapAfterOutputFailure(new Error("Agent output stream ended"));
+				return;
+			}
 			await child.exited.catch(() => {});
 			if (!readySettled) {
 				readySettled = true;
 				readyReject(new Error(`Agent process exited before ready. Stderr: ${child.peekStderr()}`));
 			}
-		})().catch((err: Error) => {
+		})().catch(async (cause: unknown) => {
+			const error = cause instanceof Error ? cause : new Error(String(cause));
 			if (!readySettled) {
 				readySettled = true;
-				readyReject(err);
+				readyReject(error);
+				return;
 			}
+			await reapAfterOutputFailure(new Error(`Agent output reader failed: ${error.message}`, { cause: error }));
 		});
 
 		// Also race against process exit (in case stdout closes before we read it)
@@ -325,20 +350,12 @@ export class RpcClient {
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
 			}
-		} catch (err) {
-			// Startup failed after we spawned the child. Kill it and clear
-			// state so the caller (or a retry via start() again) does not
-			// leak the abandoned process (issue #4079).
-			try {
-				child.kill();
-			} catch {
-				// best-effort cleanup
-			}
-			this.#abortController.abort();
-			if (this.#process === child) {
-				this.#process = null;
-			}
-			throw err;
+		} catch (cause) {
+			// Startup failed after spawning the child. Reap it before returning
+			// so a retry cannot inherit a live worker or its session lock.
+			const error = cause instanceof Error ? cause : new Error(String(cause));
+			await reapAfterOutputFailure(error);
+			throw cause;
 		} finally {
 			clearTimeout(readyTimeout);
 		}
@@ -350,12 +367,14 @@ export class RpcClient {
 	stop() {
 		if (!this.#process) return;
 
+		const error = new Error("Client stopped");
 		this.#process.kill();
-		this.#abortController.abort();
+		this.#abortController.abort(error);
 		this.#process = null;
+		for (const request of this.#pendingRequests.values()) request.reject(error);
 		this.#pendingRequests.clear();
 		for (const pendingCall of this.#pendingHostToolCalls.values()) {
-			pendingCall.controller.abort();
+			pendingCall.controller.abort(error);
 		}
 		this.#pendingHostToolCalls.clear();
 	}

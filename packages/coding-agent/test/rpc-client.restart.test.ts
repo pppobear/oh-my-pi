@@ -1,8 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 const MOCK_AGENT = path.join(import.meta.dir, "fixtures", "mock-rpc-agent.ts");
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 describe("RpcClient lifecycle (issue #4079 B)", () => {
 	test("start() succeeds a second time after stop() on the same instance", async () => {
@@ -39,4 +49,44 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		// legitimate startup error.
 		await expect(client.start()).rejects.toThrow(/Unknown provider.*__missing_provider__/);
 	}, 30000);
+
+	test("stop() rejects active requests instead of leaving them to time out", async () => {
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: { MOCK_RPC_IGNORE_COMMANDS: "1" },
+		});
+		await client.start();
+
+		const pending = client.getState();
+		client.stop();
+
+		await expect(pending).rejects.toThrow("Client stopped");
+	});
+
+	test("rejects pending requests and reaps the worker when stdout parsing fails", async () => {
+		// This awaits the real child-process grace-to-hard-kill path; fake timers
+		// cannot drive OS signal delivery or process reaping.
+		using tempDir = TempDir.createSync("@omp-rpc-reader-failure-");
+		const pidFile = tempDir.join("pid");
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: {
+				MOCK_RPC_PID_FILE: pidFile,
+				MOCK_RPC_INVALID_OUTPUT: "1",
+				MOCK_RPC_IGNORE_SIGTERM: process.platform === "win32" ? "0" : "1",
+			},
+		});
+
+		let pid = 0;
+		try {
+			await client.start();
+			pid = Number(await Bun.file(pidFile).text());
+
+			await expect(client.getState()).rejects.toThrow(/Agent output reader failed/);
+			await expect(client.getState()).rejects.toThrow("Client not started");
+			expect(isProcessAlive(pid)).toBe(false);
+		} finally {
+			if (pid > 0 && isProcessAlive(pid)) process.kill(pid, "SIGKILL");
+		}
+	}, 10_000);
 });
