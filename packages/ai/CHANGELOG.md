@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Classified zero-output Devin `invalid_argument` trailers as context overflow when the serialized message history is already large, routing cumulative tool-output payload failures through context maintenance—including artifact-backed shake rescue—instead of retrying the same rejected history.
 ## [17.0.5] - 2026-07-18
 
 ### Changed
@@ -18,7 +21,6 @@
 - Fixed tool request failures (HTTP 400) on local grammar-constrained OpenAI-compatible backends (such as llama.cpp, LM Studio, and vLLM) by widening bare boolean subschemas into a value-accepting primitive union.
 - Fixed custom OAuth Anthropic-compatible endpoints receiving generated Claude Code fingerprint headers even when explicit header overrides were provided.
 - Fixed active sessions for plan-gated OpenAI Codex models (Sol/Luna) silently re-routing to sibling OAuth accounts when usage headroom changed, ensuring session stickiness is preserved as long as the preferred credential remains usable and eligible.
-- Classified zero-output Devin `invalid_argument` trailers as context overflow when the serialized message history is already large, routing cumulative tool-output payload failures through context maintenance—including artifact-backed shake rescue—instead of retrying the same rejected history.
 - Retry one transient OpenAI Responses stream truncation before replay-unsafe output, preventing recoverable transport truncations from surfacing as failed turns ([#5908](https://github.com/can1357/oh-my-pi/issues/5908)).
 - Kept native Kimi Code K3 thinking enabled for named function selection by using generic required tool choice.
 - Fixed `/login moonshot` validating China-platform API keys against the international host instead of honoring `MOONSHOT_BASE_URL` ([#5981](https://github.com/can1357/oh-my-pi/issues/5981)).
