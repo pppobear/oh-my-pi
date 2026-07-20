@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.6] - 2026-07-20
+
 - Fixed failed plan-mode exits leaving the session on the restored execution model while plan mode remained active and silently changing ambient `xd://` tool presentation; rollback now restores the plan model, thinking level, and exact top-level-versus-mounted tool partition so exit can be retried safely ([#6013](https://github.com/can1357/oh-my-pi/pull/6013)).
 
 ### Added

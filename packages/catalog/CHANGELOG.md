@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.6] - 2026-07-20
+
 ### Added
 
 - Added static fallback seed for Devin's `swe-1-7` model so it is bundled even when catalog generation runs without a Devin session token.

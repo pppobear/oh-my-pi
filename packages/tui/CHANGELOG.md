@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.0.6] - 2026-07-20
+
 ### Fixed
 
 - Fixed idle Loader animations on WSL repeatedly entering render scheduling after an expired ConPTY post-paint settle window instead of resuming direct component writes ([#6024](https://github.com/can1357/oh-my-pi/issues/6024)).
