@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed custom Anthropic base URLs losing native thinking signatures in the leaked-thinking recovery wrapper: the signature Anthropic delivers at `thinking_end` (after all `thinking_delta` events) was ignored, so continuations replayed the block with an empty signature and signing endpoints rejected it ([#6046](https://github.com/can1357/oh-my-pi/issues/6046)).
+
 ## [17.0.5] - 2026-07-18
 
 ### Changed
