@@ -8,6 +8,9 @@
 ### Added
 
 - Added jsdiff-compatible native diff exports: `diffLines`, `diffWords`, `diffLineRuns`, and `structuredPatchHunks` ([#6279](https://github.com/can1357/oh-my-pi/pull/6279) by [@wolfiesch](https://github.com/wolfiesch)).
+### Added
+
+- Added batch vector kernels for mnemopi recall paths: `cosineSimilarityPairs`, `vectorIndexTopK`, and `mmrRerankIndices` ([#6280](https://github.com/can1357/oh-my-pi/pull/6280) by [@wolfiesch](https://github.com/wolfiesch)).
 
 ## [17.0.5] - 2026-07-18
 

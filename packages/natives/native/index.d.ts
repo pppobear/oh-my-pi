@@ -471,6 +471,17 @@ export interface ContextLine {
 export declare function copyToClipboard(text: string): void
 
 /**
+ * All pairs `(i, j)` with `i < j` whose cosine similarity meets `threshold`.
+ *
+ * `vectors` is `count` vectors flattened row-major at `dim` `f64` elements
+ * per row (zero-padded, which matches the TS `?? 0` missing-element
+ * semantics), so the similarity is bit-identical to the TS pairwise loop in
+ * `clusterBySimilarity`. Returns pairs flattened as `[i0, j0, i1, j1, ...]`
+ * in the same `(i, j)` visit order as the TS nested loop.
+ */
+export declare function cosineSimilarityPairs(vectors: Float64Array, count: number, dim: number, threshold: number): Uint32Array
+
+/**
  * Count tokens in `input`.
  *
  * `input` may be a single string or an array of strings; an array returns
@@ -1250,6 +1261,28 @@ export interface MinimizerResult {
   outputBytes: number
 }
 
+/**
+ * MMR selection over pre-sorted candidates using Jaccard word similarity.
+ *
+ * `contents[i]` and `scores[i]` describe candidate `i`, already sorted by
+ * relevance exactly as the TS `mmrRerank` sorts them (the JS stable sort
+ * stays on the TS side so its tie and NaN semantics are preserved).
+ * Replicates the TS selection loop exactly: candidate `0` is always taken
+ * first; each round picks the remaining candidate maximizing
+ * `lambda * score - (1 - lambda) * maxSimilarity(selected)` with strict
+ * `>` comparisons, so ties keep the earliest remaining candidate — and a
+ * round where every score is `NaN` picks the first remaining candidate,
+ * matching the TS `bestIdx = 0` initialisation. Returns the selected
+ * indices into the input order.
+ *
+ * Word tokenization matches `text.toLowerCase().split(/\s+/)` (ECMA `\s`,
+ * Unicode default full case conversion). Known divergence: unpaired
+ * surrogates arrive here as U+FFFD, while JS keeps the lone surrogate; both
+ * tokenize to a single non-whitespace word so Jaccard counts still agree
+ * unless a text mixes U+FFFD words with lone-surrogate words.
+ */
+export declare function mmrRerankIndices(contents: Array<string>, scores: Float64Array, lambdaParam: number, topK: number): Uint32Array
+
 /** Parsed Kitty keyboard protocol sequence result for a Kitty input sequence. */
 export interface ParsedKittyResult {
   /** Primary codepoint associated with the key. */
@@ -1667,6 +1700,31 @@ export declare function supportsLanguage(lang: string): boolean
  * Pads with spaces when requested.
  */
 export declare function truncateToWidth(text: string, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): string
+
+/**
+ * Score every row of a normalized `f32` matrix against `query` and return
+ * the top `limit` rows.
+ *
+ * Mirrors the TS `searchExactVectorIndex` loop bit-exactly: the query is
+ * normalized by the L2 norm of its *full* length, each row score sums
+ * `matrix[row][col] * (query[col] / norm)` over
+ * `min(query.len, dimensions)` columns in column order. Ranking matches the
+ * TS stable sort: score descending, lower row index first on exact ties
+ * (`-0.0` and `+0.0` compare equal). Callers are expected to enforce the TS
+ * guards first (finite query with a positive norm, non-empty matrix).
+ */
+export declare function vectorIndexTopK(matrix: Float32Array, dimensions: number, query: Float64Array, limit: number): VectorTopK
+
+/**
+ * Top-k rows of a normalized vector matrix ranked by dot product with a
+ * normalized query.
+ */
+export interface VectorTopK {
+  /** Row indices of the selected hits, best score first. */
+  indices: Uint32Array
+  /** Scores aligned with `indices`. */
+  scores: Float64Array
+}
 
 /**
  * Calculate visible width of text, excluding ANSI escape sequences.
