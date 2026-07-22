@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed global `setModelRole` persisting the entire stale in-memory `modelRoles` record, which clobbered concurrent/external per-role edits to `config.yml` (roles reverted, added keys vanished) when a process with a stale global snapshot made one global model switch. Global saves now merge only the changed role into the re-read file, mirroring the project save path ([#6260](https://github.com/can1357/oh-my-pi/issues/6260)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

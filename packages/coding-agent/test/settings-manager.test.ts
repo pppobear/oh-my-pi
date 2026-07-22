@@ -422,6 +422,41 @@ describe("Settings", () => {
 			expect(settings.getModelRole("smol")).toBe("anthropic/claude-haiku-4-5");
 		});
 
+		it("preserves concurrent external per-role edits when saving one global role", async () => {
+			await writeSettings({
+				modelRoles: { default: "anthropic/claude-sonnet-4-5", advisor: "moonshot/kimi-k2" },
+			});
+
+			// Process loads its #global snapshot.
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// External edit (another omp instance / manual edit): changes advisor,
+			// adds vision. This process's #global is now stale.
+			await writeSettings({
+				modelRoles: {
+					default: "anthropic/claude-sonnet-4-5",
+					advisor: "moonshot/kimi-k3:max",
+					vision: "anthropic/claude-haiku-4-5",
+				},
+			});
+
+			// This process makes one global-scope role switch and flushes.
+			settings.setModelRole("smol", "anthropic/claude-haiku-4-5");
+			await settings.flush();
+
+			const savedSettings = await readSettings();
+			// The role we changed lands…
+			expect((savedSettings.modelRoles as Record<string, string>).smol).toBe("anthropic/claude-haiku-4-5");
+			// …and the concurrent external per-role edits survive rather than
+			// being clobbered by our stale whole-map snapshot.
+			expect(savedSettings.modelRoles).toEqual({
+				default: "anthropic/claude-sonnet-4-5",
+				advisor: "moonshot/kimi-k3:max",
+				vision: "anthropic/claude-haiku-4-5",
+				smol: "anthropic/claude-haiku-4-5",
+			});
+		});
+
 		it("restores persisted model roles after clearing runtime overrides", async () => {
 			await writeSettings({
 				modelRoles: { default: "anthropic/claude-sonnet-4-5" },

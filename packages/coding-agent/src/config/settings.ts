@@ -330,6 +330,8 @@ export class Settings {
 	#modified = new Set<string>();
 	/** Individual project model roles modified during this session */
 	#modifiedProjectModelRoles = new Set<string>();
+	/** Individual global model roles modified during this session (for partial save) */
+	#modifiedGlobalModelRoles = new Set<string>();
 	/**
 	 * Original process-wide model-role overrides captured before a project edit
 	 * temporarily replaced them via `#updateRuntimeModelRoleOverride`. Restored
@@ -551,7 +553,7 @@ export class Settings {
 		if (this.#projectSavePromise) {
 			await this.#projectSavePromise;
 		}
-		if (this.#modified.size > 0) {
+		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
 			await this.#saveNow();
 		}
 		if (this.#modifiedProjectModelRoles.size > 0) {
@@ -833,13 +835,22 @@ export class Settings {
 	 * stale skip in place.
 	 */
 	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
+		const prev = this.get("modelRoles");
 		const current = this.#modelRolesFromLayer(this.#global);
 		if (modelId === undefined) {
 			delete current[role];
 		} else {
 			current[role] = modelId;
 		}
-		this.set("modelRoles", current);
+		// Persist per-role rather than marking the whole `modelRoles` path
+		// modified: #saveNow merges only the changed role into the re-read
+		// file, so a concurrent external edit to a sibling role is not
+		// clobbered by this process's stale in-memory snapshot.
+		setByPath(this.#global, ["modelRoles"], current);
+		this.#modifiedGlobalModelRoles.add(role);
+		this.#rebuildMerged();
+		this.#queueSave();
+		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prev);
 		if (this.isProjectModelRoleRuntimeOverrideActive(role)) {
 			return;
 		}
@@ -1634,22 +1645,42 @@ export class Settings {
 	}
 
 	async #saveNow(): Promise<void> {
-		if (!this.#persist || !this.#configPath || this.#modified.size === 0) return;
+		if (!this.#persist || !this.#configPath) return;
+		if (this.#modified.size === 0 && this.#modifiedGlobalModelRoles.size === 0) return;
 
 		const configPath = this.#configPath;
 		const modifiedPaths = [...this.#modified];
+		const modifiedModelRoles = [...this.#modifiedGlobalModelRoles];
 		this.#modified.clear();
+		this.#modifiedGlobalModelRoles.clear();
 
 		try {
 			await withFileLock(configPath, async () => {
 				// Re-read to preserve external changes
 				const current = await this.#loadYaml(configPath);
 
-				// Apply only our modified paths
+				// Apply only our modified whole-value paths
 				for (const modPath of modifiedPaths) {
 					const segments = modPath.split(".");
 					const value = getByPath(this.#global, segments);
 					setByPath(current, segments, value);
+				}
+
+				// Merge only the model roles we changed, so a concurrent
+				// external edit to a sibling role survives instead of being
+				// clobbered by our stale whole-map snapshot.
+				if (modifiedModelRoles.length > 0) {
+					const globalRoles = this.#modelRolesFromLayer(this.#global);
+					const currentRoles = getByPath(current, ["modelRoles"]);
+					const mergedRoles: Record<string, unknown> = isRecord(currentRoles) ? { ...currentRoles } : {};
+					for (const role of modifiedModelRoles) {
+						if (Object.hasOwn(globalRoles, role)) {
+							mergedRoles[role] = globalRoles[role];
+						} else {
+							delete mergedRoles[role];
+						}
+					}
+					setByPath(current, ["modelRoles"], mergedRoles);
 				}
 
 				// Update our global with any external changes we preserved
@@ -1661,6 +1692,9 @@ export class Settings {
 			// Re-add failed paths for retry
 			for (const p of modifiedPaths) {
 				this.#modified.add(p);
+			}
+			for (const role of modifiedModelRoles) {
+				this.#modifiedGlobalModelRoles.add(role);
 			}
 		}
 
