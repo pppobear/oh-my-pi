@@ -568,4 +568,54 @@ esac
 			await shutdown(client);
 		}
 	}, 20_000);
+
+	// Regression (PR #6305 review): readyAt belongs to the exited generation, so a
+	// daemon in the restart backoff window must not report readiness. #settle now
+	// clears readyAt/readyMatch when entering "restarting"; without that, start and
+	// for:"ready" waits race a dead service during the backoff.
+	it("clears stale readiness while a daemon is restarting", async () => {
+		const projectDir = await tempDir("omp-daemon-restart-project-");
+		const runtimeDir = await tempDir("omp-daemon-restart-runtime-");
+		const scriptPath = path.join(projectDir, "flap.ts");
+		// Becomes ready (prints the pattern), then crashes shortly after.
+		await Bun.write(scriptPath, `process.stdout.write("READY\\n"); setTimeout(() => process.exit(1), 50);\n`);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		try {
+			const spec: DaemonSpec = {
+				name: "flap",
+				application: process.execPath,
+				args: [scriptPath],
+				env: {},
+				cwd: projectDir,
+				pty: false,
+				ready: { log: "READY", timeoutMs: 60_000 },
+				restart: "on-failure",
+				persist: false,
+				detached: false,
+			};
+			const started = await client.request({ op: "start", spec });
+			expect(started.op).toBe("start");
+			if (started.op !== "start") throw new Error("unexpected start result");
+			expect(started.daemon.readyAt).toBeDefined();
+
+			// Catch the backoff window: once restarting, readiness must be cleared.
+			const restarting = await waitUntil(async () => {
+				const listed = await client.request({ op: "list" });
+				if (listed.op !== "list") return false;
+				const daemon = listed.daemons.find(d => d.name === "flap");
+				return daemon?.state === "restarting";
+			}, 15_000);
+			expect(restarting).toBeTrue();
+			const listed = await client.request({ op: "list" });
+			if (listed.op !== "list") throw new Error("unexpected list result");
+			const daemon = listed.daemons.find(d => d.name === "flap");
+			expect(daemon?.state).toBe("restarting");
+			expect(daemon?.readyAt).toBeUndefined();
+			expect(daemon?.readyMatch).toBeUndefined();
+
+			await client.request({ op: "stop", name: "flap", timeoutMs: 2_000 });
+		} finally {
+			await shutdown(client);
+		}
+	}, 30_000);
 });

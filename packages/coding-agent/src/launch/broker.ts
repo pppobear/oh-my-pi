@@ -757,6 +757,11 @@ class DaemonBroker {
 			const uptime = Date.now() - record.snapshot.startedAt;
 			record.consecutiveFailures = uptime >= 30_000 ? 0 : record.consecutiveFailures + 1;
 			record.snapshot.restartCount++;
+			// Readiness belongs to the exited generation; clear it before the backoff
+			// so start / for:"ready" waits don't treat a dead service as ready during
+			// the restart window (readyAt is re-set by #launch once the child is up).
+			record.snapshot.readyAt = undefined;
+			record.snapshot.readyMatch = undefined;
 			record.snapshot.state = "restarting";
 			const delay = Math.min(1_000 * 2 ** Math.min(record.consecutiveFailures, 5), RESTART_MAX_DELAY_MS);
 			record.log?.append(
