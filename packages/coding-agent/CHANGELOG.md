@@ -188,6 +188,10 @@
 
 - Fixed near-miss `xd://` write targets silently creating filesystem paths instead of surfacing a corrective URI error ([#6123](https://github.com/can1357/oh-my-pi/issues/6123)).
 
+### Fixed
+
+- Fixed the `task` tool rejecting a valid batch `{ context, tasks[] }` call with the misleading `task must be a string (was missing)` when `task.batch` was disabled. The flat single-spawn wire schema strips `tasks`/`context` (arktype `"+": "delete"`) and then fails on the now-missing `task` in the agent loop, preempting the tool's own actionable shape check. The tool now uses lenient argument validation so those raw args reach `execute()`, which explains the real cause (`task.batch is disabled…`) ([#6039](https://github.com/can1357/oh-my-pi/issues/6039)).
+
 ## [17.0.5] - 2026-07-18
 
 ### Added
