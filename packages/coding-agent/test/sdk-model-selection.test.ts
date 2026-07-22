@@ -352,10 +352,10 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
-	test("uses a configured role fallback when its primary model is unavailable", async () => {
+	test("uses a configured suffixed role fallback when its primary model is unavailable", async () => {
 		const settings = Settings.isolated({
 			"retry.fallbackChains": {
-				slow: ["missing-provider/missing-fallback", "runtime-provider/runtime-model"],
+				slow: ["missing-provider/missing-fallback", "runtime-provider/runtime-reasoning-model"],
 			},
 		});
 		settings.setModelRole("slow", "missing-provider/missing-model");
@@ -363,7 +363,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		authStorage.setRuntimeApiKey("runtime-provider", "test-key");
 		authStoragesToClose.push(authStorage);
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "missing-role-models.yml"));
-		const parsed = parseArgs(["--model", "slow"]);
+		const parsed = parseArgs(["--model", "slow:high"]);
 		const exitSpy = vi.spyOn(process, "exit").mockImplementation((code?: number | string | null) => {
 			throw new Error(`buildSessionOptions unexpectedly exited with ${code}`);
 		});
@@ -375,7 +375,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				modelRegistry,
 				settings,
 			);
-			expect(cliOptions.modelPattern).toBe("slow");
+			expect(cliOptions.modelPattern).toBe("slow:high");
 
 			const { session, modelFallbackMessage } = await createAgentSession({
 				...cliOptions,
@@ -397,7 +397,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 			try {
 				expect(session.model?.provider).toBe("runtime-provider");
-				expect(session.model?.id).toBe("runtime-model");
+				expect(session.model?.id).toBe("runtime-reasoning-model");
+				expect(session.thinkingLevel).toBe(Effort.High);
 				expect(modelFallbackMessage).toBeUndefined();
 			} finally {
 				await session.dispose();

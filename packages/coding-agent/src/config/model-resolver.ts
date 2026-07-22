@@ -1720,7 +1720,12 @@ export function resolveCliModel(options: {
 					? `${formatModelRoleAlias(bareRoleName)}${bareRoleThinkingLevel ? `:${bareRoleThinkingLevel}` : ""}`
 					: undefined;
 		if (roleSelector) {
-			const configuredRole = getModelRoleAlias(roleSelector, settings);
+			const { base: roleAlias } = splitThinkingSuffix(
+				roleSelector,
+				modelRoleAliasPrefixLength(roleSelector) ?? -1,
+				MAX_THINKING_SUFFIX_OPTIONS,
+			);
+			const configuredRole = getModelRoleAlias(roleAlias, settings);
 			configuredPatterns = resolveConfiguredModelPatterns([roleSelector], settings);
 			const resolved = resolveModelRoleValue(roleSelector, availableModels, {
 				settings,
