@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `tools.maxTimeout` only clamping explicitly-passed tool timeouts: the per-tool default (e.g. `bash` 300s), used whenever the agent omits `timeout`, bypassed the ceiling entirely. `clampTimeout` now caps the resolved effective timeout — including the default-fallback path — against `tools.maxTimeout` at every call site (`bash`, `eval`, `browser`, `debug`, `lsp`, `fetch`, and the session-level bash executor) ([#6294](https://github.com/can1357/oh-my-pi/issues/6294)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
