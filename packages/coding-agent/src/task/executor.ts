@@ -55,6 +55,7 @@ import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { generateTaskLabel } from "./label";
+import { resolveAgentPrewalkDefault } from "./prewalk";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -2451,11 +2452,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// frontmatter default; the `task.prewalk` toggle (default off) arms it.
 			// Resolution failures skip prewalk instead of failing the spawn.
 			let prewalk: Prewalk | undefined;
-			const genericTaskPrewalk =
-				agent.source === "bundled" && agent.name === "task" && settings.get("task.prewalk") ? true : undefined;
 			const prewalkPattern = resolveAgentPrewalkPattern({
 				settingsOverride: settings.get("task.agentPrewalk")[agent.name],
-				agentPrewalk: agent.prewalk ?? genericTaskPrewalk,
+				agentPrewalk: resolveAgentPrewalkDefault(agent, settings.get("task.prewalk")),
 			});
 			if (prewalkPattern) {
 				const resolvedPrewalk = resolveModelOverride([prewalkPattern], modelRegistry, settings);

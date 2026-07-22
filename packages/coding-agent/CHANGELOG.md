@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/agents` showing prewalk as off for the bundled `task` agent when `task.prewalk` enables its runtime default ([#6306](https://github.com/can1357/oh-my-pi/issues/6306)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
