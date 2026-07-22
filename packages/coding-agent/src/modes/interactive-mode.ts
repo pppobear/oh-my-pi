@@ -1691,6 +1691,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		const context = this.viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: settings.get("display.collapseCompacted"),
 		});
+		// Prune the settled-component cache to the messages this rebuild will
+		// actually render. Message objects stay strongly reachable through
+		// session entries for the whole session, so entries for compacted-away
+		// history would otherwise pin their components' rendered layout caches
+		// forever — exactly the memory a collapsed compaction used to release.
+		const retained = new WeakMap<AgentMessage, Component>();
+		for (const message of context.messages) {
+			const component = this.transcriptMessageComponents.get(message);
+			if (component) retained.set(message, component);
+		}
+		this.transcriptMessageComponents = retained;
 		this.renderSessionContext(context, { reuseSettledComponents: options.reuseSettledComponents });
 		for (const child of liveComponents) {
 			this.chatContainer.addChild(child);
