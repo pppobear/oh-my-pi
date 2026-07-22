@@ -37,6 +37,9 @@
 - Removed GPT-5.4 nano from openai-codex catalog
 - Removed SWE-1.6 family models from devin catalog
 - Removed Nemotron 3 Ultra from devin catalog
+### Fixed
+
+- Fixed GPT-5.6 Codex SKUs (`gpt-5.6-{sol,terra,luna}`) losing ~75K of usable context when the Codex discovery endpoint actively reports `context_window: 272000`: discovery now floors these SKUs at the 372K hard capacity instead of only substituting it when the field is absent, so the runtime dynamic value no longer overwrites the bundled pin ([#6259](https://github.com/can1357/oh-my-pi/issues/6259)).
 
 ## [17.0.6] - 2026-07-20
 
