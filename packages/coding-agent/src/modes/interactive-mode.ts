@@ -4663,6 +4663,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#extensionUiController.initHooksAndCustomTools();
 	}
 
+	getToolUIContext(): ExtensionUIContext | undefined {
+		return this.#extensionUiController.getToolUIContext();
+	}
+
 	emitCustomToolSessionEvent(
 		reason: "start" | "switch" | "branch" | "tree" | "shutdown",
 		previousSessionFile?: string,

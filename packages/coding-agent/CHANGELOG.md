@@ -39,6 +39,11 @@
 
 - Fixed HTML session exports overflowing the browser call stack when rendering valid deeply nested conversation trees.
 
+### Added
+
+- Added `/tree` re-answer for a past `ask` toolResult: selecting it now re-opens the picker with the original questions and branches the new answer as a sibling toolResult, leaving the original answer's branch reachable ([#5895](https://github.com/can1357/oh-my-pi/pull/5895) by [@Mathews-Tom](https://github.com/Mathews-Tom)).
+
+## [17.0.3] - 2026-07-17
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
