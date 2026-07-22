@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `omp models` hanging after output when loaded extensions kept background resources alive; the one-shot command now emits `session_shutdown` and clears managed extension timers before returning ([#6297](https://github.com/can1357/oh-my-pi/issues/6297)).
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed
